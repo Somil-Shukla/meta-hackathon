@@ -3,11 +3,16 @@ Inference Script — Fraud Detection Environment
 ===============================================
 
 An LLM-driven agent runner that plays multi-agent episodes of the
-FraudEnvironment.  Two LLM calls are made per step:
-  1. Defender agent — given the defender observation, outputs a JSON action.
-  2. Fraudster agent — given the fraudster observation, outputs a JSON action.
+FraudEnvironment using a **turn-based** protocol:
 
-Both actions are combined into a single ``FraudAction`` and sent to ``step()``.
+  1. ``reset()`` → fraudster receives its observation and acts first.
+  2. Fraudster ``step()`` → environment processes fraudster action, returns
+     defender observation.
+  3. Defender ``step()`` → environment processes defender action, runs world
+     transition, emits rewards.  Returns next fraudster observation or done.
+  4. Repeat from step 2 until done=True.
+
+Each full round (fraudster half + defender half) corresponds to one [STEP] log.
 
 Required environment variables
 -------------------------------
@@ -283,7 +288,7 @@ def _build_fraudster_message(step: int, obs: FraudObservation) -> str:
     return "\n".join(parts)
 
 # ---------------------------------------------------------------------------
-# Single episode runner
+# Single episode runner (turn-based)
 # ---------------------------------------------------------------------------
 
 async def run_episode(
@@ -291,102 +296,162 @@ async def run_episode(
     llm: OpenAI,
     task_name: str,
 ) -> Tuple[bool, int, float]:
+    """
+    Run one episode using the turn-based protocol.
+
+    Round structure:
+      1. Fraudster receives its obs → sends fraudster action.
+      2. Defender receives its obs  → sends defender action.
+      3. Rewards emitted; loop repeats until done.
+    """
     result = await env.reset(task_name=task_name)
-    obs    = result.observation
+    obs    = result.observation   # fraudster observation (current_agent="fraudster")
 
     print(f"\n{'='*60}")
     print(f"EPISODE  task={task_name}  family={obs.task_name}")
     print(f"{'='*60}")
 
-    total_defender_reward  = 0.0
-    steps_taken = 0
+    total_defender_reward = 0.0
+    full_steps_taken = 0
 
-    for step in range(1, DEFAULT_MAX_STEPS + 1):
-        steps_taken  = step
-        step_error   = None
-        legal_def    = obs.available_defender_actions or []
-        legal_frd    = obs.available_fraudster_actions or []
-        def_targets  = obs.defender_action_targets or {}
-        frd_targets  = obs.fraudster_action_targets or {}
+    # Track per-round actions for logging
+    frd_action_type: FraudsterActionType = FraudsterActionType.DO_NOTHING
+    def_action_type: DefenderActionType  = DefenderActionType.DO_NOTHING
+    frd_target: Optional[str] = None
+    def_target: Optional[str] = None
+    step_error: Optional[str] = None
 
-        # ── Defender LLM call ────────────────────────────────────────────────
-        def_response = ""
-        try:
-            completion = llm.chat.completions.create(
-                model=MODEL_NAME,
-                messages=[
-                    {"role": "system", "content": _DEFENDER_SYSTEM},
-                    {"role": "user",   "content": _build_defender_message(step, obs)},
-                ],
-                temperature=TEMPERATURE,
-                max_tokens=MAX_TOKENS,
-            )
-            def_response = completion.choices[0].message.content or ""
-        except Exception as e:
-            step_error = str(e)
-
-        def_action_type, def_target = _parse_defender_action(
-            def_response, legal_def, def_targets
-        )
-
-        # ── Fraudster LLM call ───────────────────────────────────────────────
-        frd_response = ""
-        try:
-            completion = llm.chat.completions.create(
-                model=MODEL_NAME,
-                messages=[
-                    {"role": "system", "content": _FRAUDSTER_SYSTEM},
-                    {"role": "user",   "content": _build_fraudster_message(step, obs)},
-                ],
-                temperature=TEMPERATURE,
-                max_tokens=MAX_TOKENS,
-            )
-            frd_response = completion.choices[0].message.content or ""
-        except Exception as e:
-            step_error = (step_error or "") + " | " + str(e)
-
-        frd_action_type, frd_target = _parse_fraudster_action(
-            frd_response, legal_frd, frd_targets
-        )
-
-        # ── Step environment ─────────────────────────────────────────────────
-        action = FraudAction(
-            defender_action=def_action_type,
-            defender_target=def_target,
-            fraudster_action=frd_action_type,
-            fraudster_target=frd_target,
-        )
-        result = await env.step(action)
-        obs    = result.observation
-        done   = result.done or False
-
-        d_reward = obs.defender_reward or 0.0
-        f_reward = obs.fraudster_reward or 0.0
-        total_defender_reward += d_reward
-
-        log_step(step, def_action_type.value, frd_action_type.value, done, step_error)
-        print(
-            f"  defender={def_action_type.value}({def_target})  "
-            f"D-reward={d_reward:+.3f}  "
-            f"fraudster={frd_action_type.value}({frd_target})  "
-            f"F-reward={f_reward:+.3f}"
-        )
-
-        if done:
-            info = obs.info or {}
-            grade = info.get("grade", {})
-            print(f"\n  EPISODE DONE — reason={obs.reason}")
-            if grade:
-                print(f"  Defender score  : {grade.get('defender_score', '?')}")
-                print(f"  Fraudster score : {grade.get('fraudster_score', '?')}")
-                print(f"  Fraud prevented : {grade.get('total_fraud_prevented', '?')}")
-                print(f"  Fraud escaped   : {grade.get('total_fraud_escaped', '?')}")
-                print(f"  False positives : {grade.get('false_positive_count', '?')}")
+    for _half_step in range(DEFAULT_MAX_STEPS * 2 + 4):
+        if obs.done:
             break
 
-    score    = round(total_defender_reward / max(1, steps_taken), 4)
-    success  = (obs.info or {}).get("grade", {}).get("defender_score", 0) > 0.5
-    return bool(success), steps_taken, score
+        current_agent = obs.current_agent
+
+        # ── FRAUDSTER TURN ───────────────────────────────────────────────────
+        if current_agent == "fraudster":
+            full_steps_taken += 1
+            step_error = None
+            legal_frd   = obs.available_fraudster_actions or []
+            frd_targets = obs.fraudster_action_targets or {}
+
+            print(f"\n--- Step {full_steps_taken} ---", flush=True)
+
+            frd_response = ""
+            try:
+                completion = llm.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=[
+                        {"role": "system", "content": _FRAUDSTER_SYSTEM},
+                        {"role": "user",   "content": _build_fraudster_message(
+                            full_steps_taken, obs
+                        )},
+                    ],
+                    temperature=TEMPERATURE,
+                    max_tokens=MAX_TOKENS,
+                )
+                frd_response = completion.choices[0].message.content or ""
+            except Exception as e:
+                step_error = str(e)
+
+            frd_action_type, frd_target = _parse_fraudster_action(
+                frd_response, legal_frd, frd_targets
+            )
+
+            print(
+                f"  [FRAUDSTER] {frd_action_type.value}({frd_target})",
+                flush=True,
+            )
+
+            action = FraudAction(
+                fraudster_action=frd_action_type,
+                fraudster_target=frd_target,
+            )
+            result = await env.step(action)
+            obs    = result.observation
+            # obs.current_agent is now "defender"
+
+        # ── DEFENDER TURN ────────────────────────────────────────────────────
+        elif current_agent == "defender":
+            legal_def   = obs.available_defender_actions or []
+            def_targets = obs.defender_action_targets or {}
+
+            def_response = ""
+            try:
+                completion = llm.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=[
+                        {"role": "system", "content": _DEFENDER_SYSTEM},
+                        {"role": "user",   "content": _build_defender_message(
+                            full_steps_taken, obs
+                        )},
+                    ],
+                    temperature=TEMPERATURE,
+                    max_tokens=MAX_TOKENS,
+                )
+                def_response = completion.choices[0].message.content or ""
+            except Exception as e:
+                step_error = (step_error or "") + " | " + str(e)
+
+            def_action_type, def_target = _parse_defender_action(
+                def_response, legal_def, def_targets
+            )
+
+            print(
+                f"  [DEFENDER]  {def_action_type.value}({def_target})",
+                flush=True,
+            )
+
+            action = FraudAction(
+                defender_action=def_action_type,
+                defender_target=def_target,
+            )
+            result = await env.step(action)
+            obs    = result.observation
+            done   = result.done or False
+
+            # Rewards are emitted after the defender's half-step
+            d_reward = obs.defender_reward or 0.0
+            f_reward = obs.fraudster_reward or 0.0
+            total_defender_reward += d_reward
+
+            print(
+                f"  [REWARDS]   F-reward={f_reward:+.3f}  D-reward={d_reward:+.3f}  done={done}",
+                flush=True,
+            )
+            log_step(
+                full_steps_taken,
+                def_action_type.value,
+                frd_action_type.value,
+                done,
+                step_error,
+            )
+
+            if done:
+                info  = obs.info or {}
+                grade = info.get("grade", {})
+                print(f"\n  EPISODE DONE — reason={obs.reason}")
+                if grade:
+                    print(f"  Defender score  : {grade.get('defender_score', '?')}")
+                    print(f"  Fraudster score : {grade.get('fraudster_score', '?')}")
+                    print(f"  Fraud prevented : {grade.get('total_fraud_prevented', '?')}")
+                    print(f"  Fraud escaped   : {grade.get('total_fraud_escaped', '?')}")
+                    print(f"  False positives : {grade.get('false_positive_count', '?')}")
+                break
+
+        else:
+            # current_agent is None and done is False — guard against
+            # stale/incompatible server responses. Emit a visible warning
+            # so the user knows to restart the server.
+            print(
+                f"  [WARN] current_agent=None and done=False at half_step={_half_step}. "
+                "Ensure the server is restarted with the latest code.",
+                flush=True,
+            )
+            break
+
+    score   = round(total_defender_reward / max(1, full_steps_taken), 4)
+    success = (obs.info or {}).get("grade", {}).get("defender_score", 0) > 0.5
+    return bool(success), full_steps_taken, score
 
 # ---------------------------------------------------------------------------
 # Main

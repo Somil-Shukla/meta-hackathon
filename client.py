@@ -105,6 +105,16 @@ class FraudEnvClient(EnvClient[FraudAction, FraudObservation, State]):
         """Deserialise the server response into a typed StepResult."""
         obs_raw = payload.get("observation", {})
 
+        # Infer current_agent from the server field; fall back to heuristic
+        # based on which partial observation is populated, so older server
+        # builds remain compatible.
+        current_agent = obs_raw.get("current_agent")
+        if current_agent is None and not obs_raw.get("episode_done"):
+            if obs_raw.get("fraudster_obs") is not None and obs_raw.get("defender_obs") is None:
+                current_agent = "fraudster"
+            elif obs_raw.get("defender_obs") is not None and obs_raw.get("fraudster_obs") is None:
+                current_agent = "defender"
+
         observation = FraudObservation(
             episode_id=obs_raw.get("episode_id"),
             step=obs_raw.get("step"),
@@ -112,6 +122,7 @@ class FraudEnvClient(EnvClient[FraudAction, FraudObservation, State]):
             task_name=obs_raw.get("task_name"),
             episode_done=obs_raw.get("episode_done"),
             reason=obs_raw.get("reason"),
+            current_agent=current_agent,
             defender_obs=obs_raw.get("defender_obs"),
             fraudster_obs=obs_raw.get("fraudster_obs"),
             available_defender_actions=obs_raw.get("available_defender_actions"),

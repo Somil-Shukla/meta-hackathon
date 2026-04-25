@@ -51,17 +51,36 @@ app = create_app(
 
 
 def main(host: str = "0.0.0.0", port: int | None = None) -> None:
-    """Entry point for ``uv run server`` or ``python -m ...``."""
-    if port is None:
-        port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host=host, port=port)
+    """
+    Entry point for ``uv run server``, ``python -m ...``, or direct call.
+
+    Argument resolution order (highest priority first):
+      1. CLI flags   --host / --port
+      2. Function arguments (when called programmatically)
+      3. PORT environment variable
+      4. Hard-coded default: 8000
+    """
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(
+        description="Fraud Detection Environment Server",
+        # Allow unknown args so uvicorn sub-options don't crash startup
+        add_help=True,
+    )
+    parser.add_argument("--host", type=str, default=None,
+                        help="Bind host (default: 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=None,
+                        help="Bind port (default: PORT env or 8000)")
+
+    # parse_known_args so leftover uv/pip flags are ignored gracefully
+    args, _ = parser.parse_known_args(sys.argv[1:])
+
+    resolved_host = args.host or host
+    resolved_port = args.port or port or int(os.getenv("PORT", 8000))
+
+    uvicorn.run(app, host=resolved_host, port=resolved_port)
 
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Fraud Detection Environment Server")
-    parser.add_argument("--port", type=int, default=int(os.getenv("PORT", 8000)))
-    parser.add_argument("--host", type=str, default="0.0.0.0")
-    args = parser.parse_args()
-    main(host=args.host, port=args.port)
+    main()
