@@ -1,0 +1,40 @@
+# Copyright (c) 2026 - Fraud Detection RL Environment
+# OpenEnv-compatible multi-agent fraud simulation
+
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openenv-fraud_detection"
+version = "0.1.0"
+description = "Multi-agent fraud detection RL environment for OpenEnv"
+requires-python = ">=3.10"
+dependencies = [
+    # OpenEnv core runtime
+    "openenv-core[core]>=0.2.1",
+    # HTTP / server
+    "uvicorn>=0.29.0",
+    "python-dotenv>=1.0.0",
+    # LLM client (inference.py)
+    "openai>=1.0.0",
+    # RL / training
+    "torch>=2.0.0",
+    # Utilities
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.0.0",
+]
+
+[project.scripts]
+# Start the environment server: uv run server
+server = "scam_detection.server.app:main"
+
+[tool.setuptools]
+include-package-data = true
+packages = ["scam_detection", "scam_detection.server"]
+package-dir = { "scam_detection" = ".", "scam_detection.server" = "server" }
