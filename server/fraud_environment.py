@@ -1,27 +1,37 @@
 """
 FraudEnvironment — core OpenEnv-compatible environment implementation.
 
-Implements the OpenEnv ``Environment`` interface for the multi-agent
-fraud simulation.  All world logic lives in the ``scam_detection.*``
-modules; this class wires them together and exposes the standard lifecycle.
+Turn-based interaction protocol
+---------------------------------
+The episode proceeds in alternating half-steps:
 
-Episode lifecycle
------------------
-1. ``reset(task_name=...)`` → new randomised world generated; both agents
-   receive initial partial observations.
-2. Steps 1–N → both agents submit actions in a single ``step()`` call;
-   fraudster action applied first, then defender; world transitions;
-   rewards and next observations returned.
-3. Terminal step → episode ends when max_steps reached, all routes
-   deactivated, or fraud threshold exceeded.
+  1. ``reset(task_name=...)``
+       Generates a fresh world.  Returns a **fraudster** observation.
+       (current_agent="fraudster")
 
-Multi-agent design
-------------------
-The ``FraudAction`` carries both ``defender_action`` and ``fraudster_action``
-fields.  The ``FraudObservation`` carries separate partial views
-(``defender_obs``, ``fraudster_obs``) for each agent.  The base ``reward``
-field is set to the defender's reward (primary training signal); the
-fraudster's reward is available in ``info["fraudster_reward"]``.
+  2. Fraudster half-step — ``step(FraudAction(fraudster_action=..., ...))``
+       Only ``fraudster_action`` and ``fraudster_target`` are consumed.
+       The fraudster's action is applied to the world, but the world
+       transition, rewards and termination check are deferred.
+       Returns a **defender** observation. (current_agent="defender")
+
+  3. Defender half-step — ``step(FraudAction(defender_action=..., ...))``
+       Only ``defender_action`` and ``defender_target`` are consumed.
+       After applying the defender's action, the engine runs the full
+       world transition, computes rewards for both agents, and checks
+       termination.  Returns the **next fraudster** observation
+       (current_agent="fraudster") or a terminal observation (done=True).
+
+  4. Repeat from step 2 until done=True.
+
+Termination is *only* checked after the defender's half-step, so only the
+defender can end the episode.  The fraudster always tries to extend play.
+
+Reward / grading compatibility
+---------------------------------
+All reward logic (RewardEngine) and grading (GradingEngine) operate on
+both agents' results simultaneously at the end of each defender half-step,
+exactly as before.  No reward semantics have changed.
 """
 from __future__ import annotations
 
@@ -67,11 +77,14 @@ except ImportError:
 
 class FraudEnvironment(Environment):
     """
-    Multi-agent fraud simulation environment.
+    Turn-based multi-agent fraud simulation environment.
 
     Supports four fraud families: refund_abuse, mule_cashout,
     merchant_collusion, account_takeover.  Pass ``task_name="random"``
     to pick a fraud family at random each episode.
+
+    The fraudster always acts first; the defender responds.  Only the
+    defender's half-step can trigger episode termination.
     """
 
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
@@ -85,6 +98,10 @@ class FraudEnvironment(Environment):
         self._cumulative_defender: float = 0.0
         self._cumulative_fraudster: float = 0.0
         self._step_records: List[StepRecord] = []
+
+        # Turn-based phase tracking
+        self._phase: str = "fraudster"          # "fraudster" | "defender"
+        self._pending_fraudster_result: Optional[ActionResult] = None
 
         # Engine singletons
         self._scenario_gen   = ScenarioGenerator()
@@ -106,6 +123,9 @@ class FraudEnvironment(Environment):
         """
         Start a new fraud episode.
 
+        Returns the initial **fraudster** observation so the fraudster can
+        act first.
+
         Parameters
         ----------
         task_name:
@@ -120,10 +140,12 @@ class FraudEnvironment(Environment):
                 f"Unknown task_name '{task_name}'. Must be one of: {VALID_TASK_NAMES}."
             )
 
-        self._task_name          = task_name
+        self._task_name           = task_name
         self._cumulative_defender = 0.0
         self._cumulative_fraudster = 0.0
-        self._step_records       = []
+        self._step_records        = []
+        self._phase               = "fraudster"
+        self._pending_fraudster_result = None
 
         # Generate fresh world
         self._world = self._scenario_gen.generate(
@@ -137,10 +159,8 @@ class FraudEnvironment(Environment):
             step_count=0,
         )
 
-        # Build initial observations and action masks
-        def_obs  = self._obs_gen.defender_observation(self._world)
+        # Build initial fraudster observation and action mask
         frd_obs  = self._obs_gen.fraudster_observation(self._world)
-        def_mask = self._action_masker.defender_legal_actions(self._world)
         frd_mask = self._action_masker.fraudster_legal_actions(self._world)
 
         return FraudObservation(
@@ -149,17 +169,21 @@ class FraudEnvironment(Environment):
             step_budget=self._budget_dict(),
             task_name=self._world.fraud_family,
             episode_done=False,
-            defender_obs=def_obs,
+            current_agent="fraudster",
+            # Fraudster fields populated
             fraudster_obs=frd_obs,
-            available_defender_actions=list(def_mask.keys()),
             available_fraudster_actions=list(frd_mask.keys()),
-            defender_action_targets=def_mask,
             fraudster_action_targets=frd_mask,
+            # Defender fields deferred until fraudster acts
+            defender_obs=None,
+            available_defender_actions=None,
+            defender_action_targets=None,
             defender_reward=0.0,
             fraudster_reward=0.0,
             reward=0.0,
             done=False,
             info={
+                "phase": "fraudster",
                 "world_summary": self._world.to_dict(),
                 "cumulative": {
                     "defender_reward": 0.0,
@@ -172,32 +196,85 @@ class FraudEnvironment(Environment):
 
     def step(self, action: FraudAction) -> FraudObservation:  # type: ignore[override]
         """
-        Execute one combined step (both agents act simultaneously).
+        Execute one half-step for the current agent.
 
-        Processing order:
-          1. Validate action
-          2. Apply fraudster action
-          3. Apply defender action
-          4. Transition world (background transactions, risk propagation, …)
-          5. Compute rewards
-          6. Check termination
-          7. Build and return observations
+        Fraudster half-step
+        ~~~~~~~~~~~~~~~~~~~
+        Consumes ``fraudster_action`` / ``fraudster_target`` from the action.
+        Applies the fraudster's action to the world (no transition yet).
+        Returns the **defender** observation (current_agent="defender").
+        No rewards are emitted; termination is not checked.
+
+        Defender half-step
+        ~~~~~~~~~~~~~~~~~~
+        Consumes ``defender_action`` / ``defender_target`` from the action.
+        After applying the defender's action the engine runs:
+          1. Full world transition (background transactions, risk propagation…)
+          2. Reward computation for both agents
+          3. Termination check (only the defender can end the episode)
+        Returns the **next fraudster** observation (current_agent="fraudster")
+        or a terminal observation (done=True).
         """
         if self._world is None:
             raise RuntimeError("Call reset() before step().")
-        if self._world.step >= self._world.max_steps:
-            raise RuntimeError("Episode is done. Call reset().")
 
         world = self._world
 
-        # ── Apply fraudster action first ─────────────────────────────────────
-        fraudster_result = self._action_proc.apply_fraudster_action(
-            action_type=action.fraudster_action.value,
-            target=action.fraudster_target,
-            world=world,
-        )
+        # ══════════════════════════════════════════════════════════════════════
+        # FRAUDSTER HALF-STEP
+        # ══════════════════════════════════════════════════════════════════════
+        if self._phase == "fraudster":
+            if world.step >= world.max_steps:
+                raise RuntimeError("Episode is done. Call reset().")
 
-        # ── Apply defender action second ──────────────────────────────────────
+            # Apply fraudster action; no transition or termination yet
+            fraudster_result = self._action_proc.apply_fraudster_action(
+                action_type=action.fraudster_action.value,
+                target=action.fraudster_target,
+                world=world,
+            )
+            self._pending_fraudster_result = fraudster_result
+            self._phase = "defender"
+
+            # Build defender observation now that the fraudster has moved
+            def_obs  = self._obs_gen.defender_observation(world)
+            def_mask = self._action_masker.defender_legal_actions(world)
+
+            return FraudObservation(
+                episode_id=world.episode_id,
+                step=world.step,
+                step_budget=self._budget_dict(),
+                task_name=world.fraud_family,
+                episode_done=False,
+                current_agent="defender",
+                # Defender fields populated
+                defender_obs=def_obs,
+                available_defender_actions=list(def_mask.keys()),
+                defender_action_targets=def_mask,
+                # Fraudster fields deferred until full step completes
+                fraudster_obs=None,
+                available_fraudster_actions=None,
+                fraudster_action_targets=None,
+                defender_reward=None,
+                fraudster_reward=None,
+                reward=0.0,
+                done=False,
+                info={
+                    "phase": "defender",
+                    "fraudster_effect": fraudster_result.effect,
+                    "cumulative": {
+                        "defender_reward":  round(self._cumulative_defender, 4),
+                        "fraudster_reward": round(self._cumulative_fraudster, 4),
+                    },
+                },
+            )
+
+        # ══════════════════════════════════════════════════════════════════════
+        # DEFENDER HALF-STEP  (full step completion)
+        # ══════════════════════════════════════════════════════════════════════
+        fraudster_result = self._pending_fraudster_result  # stored from prior half-step
+
+        # ── Apply defender action ─────────────────────────────────────────────
         defender_result = self._action_proc.apply_defender_action(
             action_type=action.defender_action.value,
             target=action.defender_target,
@@ -212,26 +289,19 @@ class FraudEnvironment(Environment):
         self._cumulative_defender  += step_reward.defender_reward
         self._cumulative_fraudster += step_reward.fraudster_reward
 
-        # ── Check termination ─────────────────────────────────────────────────
+        # ── Termination (only checked after defender acts) ────────────────────
         term = self._termination.check(world)
 
-        # ── Build observations ────────────────────────────────────────────────
-        def_obs  = self._obs_gen.defender_observation(world)
-        frd_obs  = self._obs_gen.fraudster_observation(world)
-        def_mask = self._action_masker.defender_legal_actions(world)
-        frd_mask = self._action_masker.fraudster_legal_actions(world)
-
-        self._state.step_count += 1
-
         # ── Record for grading CSV ────────────────────────────────────────────
+        # world.step was already incremented inside transition.advance()
         step_rec = StepRecord(
             episode_id=world.episode_id,
             fraud_family=world.fraud_family,
             step=world.step,
             defender_action=action.defender_action.value,
             defender_target=action.defender_target,
-            fraudster_action=action.fraudster_action.value,
-            fraudster_target=action.fraudster_target,
+            fraudster_action=fraudster_result.action_type,
+            fraudster_target=fraudster_result.target,
             defender_reward=step_reward.defender_reward,
             fraudster_reward=step_reward.fraudster_reward,
             cumulative_defender_reward=self._cumulative_defender,
@@ -252,6 +322,11 @@ class FraudEnvironment(Environment):
             termination_reason=term.reason,
         )
         self._step_records.append(step_rec)
+
+        # ── Reset phase state ─────────────────────────────────────────────────
+        self._pending_fraudster_result = None
+        self._phase = "fraudster"
+        self._state.step_count += 1
 
         # ── Grade and save if done ────────────────────────────────────────────
         grade_info: Dict[str, Any] = {}
@@ -279,37 +354,72 @@ class FraudEnvironment(Environment):
             except Exception:
                 pass  # CSV write failure must not break the environment
 
+        # Common info payload
+        step_info: Dict[str, Any] = {
+            "fraudster_reward":           step_reward.fraudster_reward,
+            "defender_reward_breakdown":  step_reward.defender_breakdown,
+            "fraudster_reward_breakdown": step_reward.fraudster_breakdown,
+            "fraudster_effect":           fraudster_result.effect,
+            "defender_effect":            defender_result.effect,
+            "cumulative": {
+                "defender_reward":  round(self._cumulative_defender, 4),
+                "fraudster_reward": round(self._cumulative_fraudster, 4),
+            },
+            "world_summary": world.to_dict(),
+            **({"grade": grade_info} if grade_info else {}),
+        }
+
+        if term.done:
+            # Terminal: return both observations so agents can see final state
+            def_obs  = self._obs_gen.defender_observation(world)
+            frd_obs  = self._obs_gen.fraudster_observation(world)
+            def_mask = self._action_masker.defender_legal_actions(world)
+            frd_mask = self._action_masker.fraudster_legal_actions(world)
+
+            return FraudObservation(
+                episode_id=world.episode_id,
+                step=world.step,
+                step_budget=self._budget_dict(),
+                task_name=world.fraud_family,
+                episode_done=True,
+                reason=term.reason,
+                current_agent=None,
+                defender_obs=def_obs,
+                fraudster_obs=frd_obs,
+                available_defender_actions=list(def_mask.keys()),
+                available_fraudster_actions=list(frd_mask.keys()),
+                defender_action_targets=def_mask,
+                fraudster_action_targets=frd_mask,
+                defender_reward=step_reward.defender_reward,
+                fraudster_reward=step_reward.fraudster_reward,
+                reward=step_reward.defender_reward,
+                done=True,
+                info=step_info,
+            )
+
+        # Non-terminal: return next fraudster observation
+        frd_obs  = self._obs_gen.fraudster_observation(world)
+        frd_mask = self._action_masker.fraudster_legal_actions(world)
+
         return FraudObservation(
             episode_id=world.episode_id,
             step=world.step,
             step_budget=self._budget_dict(),
             task_name=world.fraud_family,
-            episode_done=term.done,
-            reason=term.reason,
-            defender_obs=def_obs,
+            episode_done=False,
+            current_agent="fraudster",
             fraudster_obs=frd_obs,
-            available_defender_actions=list(def_mask.keys()),
             available_fraudster_actions=list(frd_mask.keys()),
-            defender_action_targets=def_mask,
             fraudster_action_targets=frd_mask,
+            # Defender fields deferred until next fraudster action
+            defender_obs=None,
+            available_defender_actions=None,
+            defender_action_targets=None,
             defender_reward=step_reward.defender_reward,
             fraudster_reward=step_reward.fraudster_reward,
-            # Base reward = defender reward (primary training signal)
             reward=step_reward.defender_reward,
-            done=term.done,
-            info={
-                "fraudster_reward": step_reward.fraudster_reward,
-                "defender_reward_breakdown":  step_reward.defender_breakdown,
-                "fraudster_reward_breakdown": step_reward.fraudster_breakdown,
-                "fraudster_effect": fraudster_result.effect,
-                "defender_effect":  defender_result.effect,
-                "cumulative": {
-                    "defender_reward":  round(self._cumulative_defender, 4),
-                    "fraudster_reward": round(self._cumulative_fraudster, 4),
-                },
-                "world_summary": world.to_dict(),
-                **({"grade": grade_info} if grade_info else {}),
-            },
+            done=False,
+            info=step_info,
         )
 
     # ----------------------------------------------------------------- state
@@ -323,6 +433,6 @@ class FraudEnvironment(Environment):
     def _budget_dict(self) -> Dict[str, int]:
         if self._world is None:
             return {"total": DEFAULT_MAX_STEPS, "used": 0, "remaining": DEFAULT_MAX_STEPS}
-        used = self._world.step
+        used  = self._world.step
         total = self._world.max_steps
         return {"total": total, "used": used, "remaining": total - used}

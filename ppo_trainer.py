@@ -9,6 +9,18 @@ Architecture:
   - Defender and fraudster losses are computed independently; they do not
     share gradients.
 
+Turn-based interaction
+-----------------------
+The environment now uses a turn-based protocol: the fraudster acts first,
+then the defender.  Each pair of half-steps constitutes one full step.
+Rewards are emitted only after the defender's half-step (full-step boundary).
+The trainer follows this protocol:
+  1. obs = env.reset()  → fraudster obs
+  2. Apply fraudster policy → step() → defender obs
+  3. Apply defender policy  → step() → next fraudster obs (+ rewards)
+  4. Store one Transition per agent (rewards assigned at full-step boundary)
+  5. Repeat from 2.
+
 Usage::
 
     from scam_detection.ppo_trainer import PPOTrainer
@@ -182,66 +194,22 @@ class PPOTrainer:
             "fraudster_loss": [],
         }
 
+        # reset() returns fraudster obs (current_agent="fraudster")
         obs = self._env.reset(task_name=task_name)
         episode_def_reward = 0.0
         episode_frd_reward = 0.0
         episode_count      = 0
+        global_full_step   = 0  # counts completed full steps (fraudster + defender pairs)
 
-        for global_step in range(n_episodes * DEFAULT_MAX_STEPS):
-            # ── Collect one step ─────────────────────────────────────────────
-            def_obs = obs.defender_obs
-            frd_obs = obs.fraudster_obs
-            legal_def = obs.available_defender_actions or []
-            legal_frd = obs.available_fraudster_actions or []
-            def_targets = obs.defender_action_targets or {}
-            frd_targets = obs.fraudster_action_targets or {}
+        # Temporary holders across half-steps
+        _frd_obs     = None
+        _frd_idx     = None
+        _frd_lp      = None
+        _frd_val     = None
 
-            # Select actions
-            def_action_str, def_lp, def_ent, def_val = (
-                self.defender_policy.select_action(def_obs, legal_def)
-            )
-            frd_action_str, frd_lp, frd_ent, frd_val = (
-                self.fraudster_policy.select_action(frd_obs, legal_frd)
-            )
-
-            # Choose targets (random from legal)
-            def_target = self._pick_target(def_action_str, def_targets)
-            frd_target = self._pick_target(frd_action_str, frd_targets)
-
-            action = FraudAction(
-                defender_action=DefenderActionType(def_action_str),
-                defender_target=def_target,
-                fraudster_action=FraudsterActionType(frd_action_str),
-                fraudster_target=frd_target,
-            )
-
-            next_obs = self._env.step(action)
-            d_reward = next_obs.defender_reward or 0.0
-            f_reward = next_obs.fraudster_reward or 0.0
-            done     = next_obs.done or False
-
-            episode_def_reward += d_reward
-            episode_frd_reward += f_reward
-
-            # Store transitions
-            def_idx = self.defender_policy.ACTION_TYPES.index(def_action_str)
-            frd_idx = self.fraudster_policy.ACTION_TYPES.index(frd_action_str)
-
-            self._buffer.add(Transition(
-                obs=def_obs, action_idx=def_idx,
-                log_prob=def_lp.item(), reward=d_reward,
-                done=done, value=def_val.item(), agent="defender",
-            ))
-            self._buffer.add(Transition(
-                obs=frd_obs, action_idx=frd_idx,
-                log_prob=frd_lp.item(), reward=f_reward,
-                done=done, value=frd_val.item(), agent="fraudster",
-            ))
-
-            obs = next_obs
-
-            # ── Episode end ──────────────────────────────────────────────────
-            if done:
+        for _half in range(n_episodes * DEFAULT_MAX_STEPS * 2 + 8):
+            if obs.done:
+                # Episode ended on the previous defender half-step
                 episode_count += 1
                 history["defender_reward"].append(episode_def_reward)
                 history["fraudster_reward"].append(episode_frd_reward)
@@ -259,24 +227,95 @@ class PPOTrainer:
                 if episode_count >= n_episodes:
                     break
                 obs = self._env.reset(task_name=task_name)
+                _frd_obs = _frd_idx = _frd_lp = _frd_val = None
 
-            # ── Update every n_rollout_steps ─────────────────────────────────
-            if global_step > 0 and global_step % self.n_rollout_steps == 0:
-                d_loss = self._update_policy(
-                    self.defender_policy,
-                    self.defender_opt,
-                    self._buffer.defender_transitions(),
-                    self.defender_policy.encode_obs,
+            current_agent = obs.current_agent
+
+            # ── FRAUDSTER HALF-STEP ──────────────────────────────────────────
+            if current_agent == "fraudster":
+                frd_obs = obs.fraudster_obs
+                legal_frd   = obs.available_fraudster_actions or []
+                frd_targets = obs.fraudster_action_targets or {}
+
+                frd_action_str, frd_lp, frd_ent, frd_val = (
+                    self.fraudster_policy.select_action(frd_obs, legal_frd)
                 )
-                f_loss = self._update_policy(
-                    self.fraudster_policy,
-                    self.fraudster_opt,
-                    self._buffer.fraudster_transitions(),
-                    self.fraudster_policy.encode_obs,
+                frd_target = self._pick_target(frd_action_str, frd_targets)
+
+                # Store fraudster half-step info for later buffer insertion
+                _frd_obs = frd_obs
+                _frd_idx = self.fraudster_policy.ACTION_TYPES.index(frd_action_str)
+                _frd_lp  = frd_lp
+                _frd_val = frd_val
+
+                action = FraudAction(
+                    fraudster_action=FraudsterActionType(frd_action_str),
+                    fraudster_target=frd_target,
                 )
-                history["defender_loss"].append(d_loss)
-                history["fraudster_loss"].append(f_loss)
-                self._buffer.clear()
+                obs = self._env.step(action)
+                # obs.current_agent is now "defender"
+
+            # ── DEFENDER HALF-STEP ───────────────────────────────────────────
+            elif current_agent == "defender":
+                def_obs = obs.defender_obs
+                legal_def   = obs.available_defender_actions or []
+                def_targets = obs.defender_action_targets or {}
+
+                def_action_str, def_lp, def_ent, def_val = (
+                    self.defender_policy.select_action(def_obs, legal_def)
+                )
+                def_target = self._pick_target(def_action_str, def_targets)
+
+                action = FraudAction(
+                    defender_action=DefenderActionType(def_action_str),
+                    defender_target=def_target,
+                )
+                obs = self._env.step(action)
+                # Rewards are emitted now (after defender's half-step)
+                d_reward = obs.defender_reward or 0.0
+                f_reward = obs.fraudster_reward or 0.0
+                done     = obs.done or False
+
+                episode_def_reward += d_reward
+                episode_frd_reward += f_reward
+                global_full_step   += 1
+
+                # Store one Transition per agent for the completed full step
+                def_idx = self.defender_policy.ACTION_TYPES.index(def_action_str)
+                self._buffer.add(Transition(
+                    obs=def_obs, action_idx=def_idx,
+                    log_prob=def_lp.item(), reward=d_reward,
+                    done=done, value=def_val.item(), agent="defender",
+                ))
+                if _frd_obs is not None:
+                    self._buffer.add(Transition(
+                        obs=_frd_obs, action_idx=_frd_idx,
+                        log_prob=_frd_lp.item(), reward=f_reward,
+                        done=done, value=_frd_val.item(), agent="fraudster",
+                    ))
+                    _frd_obs = _frd_idx = _frd_lp = _frd_val = None
+
+                # ── Update every n_rollout_steps full steps ──────────────────
+                if global_full_step > 0 and global_full_step % self.n_rollout_steps == 0:
+                    d_loss = self._update_policy(
+                        self.defender_policy,
+                        self.defender_opt,
+                        self._buffer.defender_transitions(),
+                        self.defender_policy.encode_obs,
+                    )
+                    f_loss = self._update_policy(
+                        self.fraudster_policy,
+                        self.fraudster_opt,
+                        self._buffer.fraudster_transitions(),
+                        self.fraudster_policy.encode_obs,
+                    )
+                    history["defender_loss"].append(d_loss)
+                    history["fraudster_loss"].append(f_loss)
+                    self._buffer.clear()
+
+            else:
+                # current_agent is None → done=True handled at top of next iter
+                pass
 
         # Save final checkpoints
         torch.save(

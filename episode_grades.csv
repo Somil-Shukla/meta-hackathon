@@ -1,3 +1,15 @@
 episode_id,fraud_family,total_steps,total_fraud_prevented,total_fraud_escaped,false_positive_count,false_positive_rate,detection_delay,customer_friction_score,merchant_disruption_score,defender_score,fraudster_score,cumulative_defender_reward,cumulative_fraudster_reward
 816bcc30-0cba-4d72-b0df-ad63b616cdc1,refund_abuse,5,0.0,0.0,0,0.0,4.0,0.0,0.0,0.96,0.15,2.33,-1.02
 e8fd5eef-eb52-4071-ad08-707887b384f2,mule_cashout,10,0.0,0.0,0,0.0,7.25,0.0,0.0,0.9275,0.045,4.465,-1.37
+bdd640fb-0667-4ad1-9c80-317fa3b1799d,mule_cashout,20,0.0,0.0,0,0.0,20.0,0.0,0.0,0.4,0.3,0.0,0.0
+6513270e-269e-4d37-b2a7-4de452e6b438,account_takeover,20,0.0,0.0,0,0.0,20.0,0.0,0.0,0.4,0.3,0.0,0.0
+bdd640fb-0667-4ad1-9c80-317fa3b1799d,mule_cashout,20,0.0,0.0,0,0.0,20.0,0.0,0.0,0.4,0.3,0.0,0.0
+6513270e-269e-4d37-b2a7-4de452e6b438,account_takeover,20,0.0,0.0,0,0.0,20.0,0.0,0.0,0.4,0.3,0.0,0.0
+8b98f270-5d56-4176-8196-b22063df352e,refund_abuse,3,0.0,0.0,0,0.0,2.0,0.0,0.0,0.98,0.105,3.81,-1.55
+33fa5ea9-fe05-431f-8c83-03dd26da6950,mule_cashout,6,0.0,0.0,0,0.0,4.5,0.0,0.0,0.875,0.015,4.83,-1.6
+3170a37f-28df-41b7-8291-16e019c4591b,merchant_collusion,4,0.0,0.0,0,0.0,1.0,0.0,0.0,1.0,0.24,3.985,-2.7
+3fa87331-6dd5-4397-8f4c-268f451b8583,account_takeover,5,0.0,0.0,0,0.0,4.0,0.0,0.0,0.76,0.165,2.33,-1.02
+42cdf562-0c37-4d37-a5a4-82248804c557,refund_abuse,3,0.0,0.0,0,0.0,2.5,0.0,0.0,0.975,0.195,2.475,-1.12
+5bfd3b6c-e8c3-4e34-a7e4-c67316bbb8ca,mule_cashout,3,0.0,0.0,0,0.0,2.0,0.0,0.0,0.88,0.105,3.81,-1.75
+15b9f927-711c-4586-bdb3-cef7df009b87,merchant_collusion,2,0.0,0.0,0,0.0,20.0,0.0,0.0,0.6,0.285,0.85,-0.5
+c66ee085-d517-4c2c-b10f-6492c9b5d508,account_takeover,2,0.0,0.0,0,0.0,1.5,0.0,0.0,0.745,0.165,2.555,-1.1

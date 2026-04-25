@@ -7,15 +7,29 @@ OpenEnv's ``create_app`` accepts exactly **one** Action class and **one**
 Observation class.  For the multi-agent setup (defender + fraudster), we
 use a **unified superset** approach:
 
-* ``FraudAction``       — one class containing the actions for BOTH agents.
-                          The defender submits ``defender_action`` and the
-                          fraudster submits ``fraudster_action`` in each step.
+* ``FraudAction``       — one class containing fields for BOTH agents.
+                          Each ``step()`` call uses only the fields relevant
+                          to the agent whose turn it is.  The other agent's
+                          fields default to ``do_nothing``.
 * ``FraudObservation``  — one class carrying partial observations for both
-                          agents (``defender_obs`` and ``fraudster_obs``),
-                          each derived from the same hidden world state.
+                          agents (``defender_obs`` and ``fraudster_obs``).
+                          The ``current_agent`` field indicates whose turn
+                          it is; only that agent's observation fields are
+                          populated in a given response.
 
-The inference script queries two LLM agents and combines their actions into
-a single ``FraudAction`` to call ``step()`` once per round.
+Turn-based interaction protocol
+--------------------------------
+1. ``reset()``            → returns **fraudster** observation (current_agent="fraudster").
+2. Fraudster ``step()``   → sends fraudster_action; environment processes it
+                            and returns **defender** observation (current_agent="defender").
+3. Defender ``step()``    → sends defender_action; environment runs the full
+                            world transition, computes rewards, checks termination,
+                            and returns the **next fraudster** observation
+                            (current_agent="fraudster") or a terminal observation.
+4. Repeat from step 2 until ``done=True``.
+
+Only the defender can trigger episode termination (termination is checked
+exclusively after the defender's half-step).
 """
 from __future__ import annotations
 
@@ -196,6 +210,15 @@ class FraudObservation(Observation):
     fraudster_action_targets: Optional[Dict[str, List[str]]] = Field(
         default=None,
         description="Maps each legal fraudster action → list of valid target IDs.",
+    )
+
+    # ── Turn indicator ────────────────────────────────────────────────────────
+    current_agent: Optional[str] = Field(
+        default=None,
+        description=(
+            "Which agent should act next: 'fraudster' or 'defender'. "
+            "None when the episode is done."
+        ),
     )
 
     # ── Per-step rewards ──────────────────────────────────────────────────────
