@@ -14,15 +14,32 @@ FraudEnvironment using a **turn-based** protocol:
 
 Each full round (fraudster half + defender half) corresponds to one [STEP] log.
 
+Each agent (defender, fraudster) is backed by its **own** LLM, configured
+independently via environment variables.  This lets you use different models,
+API keys, or endpoints for each role — e.g. a fine-tuned defender checkpoint
+against a stronger adversarial fraudster.
+
 Required environment variables
 -------------------------------
-API_BASE_URL   API endpoint (OpenAI-compatible).
-MODEL_NAME     Model identifier.
-HF_TOKEN / API_KEY  Authentication key.
-ENV_URL        Environment server URL (default: http://localhost:8000).
+Per-agent (preferred):
+  DEFENDER_MODEL_NAME    Model for the defender (e.g. fine-tuned checkpoint).
+  DEFENDER_API_BASE_URL  API endpoint for the defender model.
+  DEFENDER_API_KEY       API key for the defender model.
+
+  FRAUDSTER_MODEL_NAME   Model for the fraudster.
+  FRAUDSTER_API_BASE_URL API endpoint for the fraudster model.
+  FRAUDSTER_API_KEY      API key for the fraudster model.
+
+Shared fallbacks (used when per-agent vars are not set):
+  API_BASE_URL           Shared API endpoint.
+  MODEL_NAME             Shared model identifier.
+  HF_TOKEN / API_KEY     Shared authentication key.
+
+Other:
+  ENV_URL                Environment server URL (default: http://localhost:8000).
 
 Structured log format (validator-compatible):
-  [START] task=<task> env=fraud_detection model=<model>
+  [START] task=<task> env=fraud_detection defender_model=<m> fraudster_model=<m>
   [STEP]  step=<n> action=<defender_action>|<fraudster_action> done=<bool> error=<null|msg>
   [END]   task=<task> success=<bool> steps=<n> score=<float>
 """
@@ -62,13 +79,25 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-API_KEY:      Optional[str] = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
-API_BASE_URL: str           = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME:   Optional[str] = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-ENV_URL:      str           = os.getenv("ENV_URL", "http://localhost:8000")
-BENCHMARK:    str           = "fraud_detection"
-TEMPERATURE:  float         = 0.2
-MAX_TOKENS:   int           = 256
+
+# Shared fallbacks — used when per-agent vars are absent
+_SHARED_API_KEY:      Optional[str] = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
+_SHARED_API_BASE_URL: str           = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+_SHARED_MODEL_NAME:   str           = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
+
+# Per-agent configuration — each falls back to the shared value if not set
+DEFENDER_MODEL_NAME:    str           = os.getenv("DEFENDER_MODEL_NAME")    or _SHARED_MODEL_NAME
+DEFENDER_API_BASE_URL:  str           = os.getenv("DEFENDER_API_BASE_URL")  or _SHARED_API_BASE_URL
+DEFENDER_API_KEY:       Optional[str] = os.getenv("DEFENDER_API_KEY")       or _SHARED_API_KEY
+
+FRAUDSTER_MODEL_NAME:   str           = os.getenv("FRAUDSTER_MODEL_NAME")   or _SHARED_MODEL_NAME
+FRAUDSTER_API_BASE_URL: str           = os.getenv("FRAUDSTER_API_BASE_URL") or _SHARED_API_BASE_URL
+FRAUDSTER_API_KEY:      Optional[str] = os.getenv("FRAUDSTER_API_KEY")      or _SHARED_API_KEY
+
+ENV_URL:     str   = os.getenv("ENV_URL", "http://localhost:8000")
+BENCHMARK:   str   = "fraud_detection"
+TEMPERATURE: float = 0.2
+MAX_TOKENS:  int   = 256
 
 _VALID_DEFENDER_ACTIONS  = [a.value for a in DefenderActionType]
 _VALID_FRAUDSTER_ACTIONS = [a.value for a in FraudsterActionType]
@@ -78,8 +107,12 @@ _JSON_RE = re.compile(r"\{.*?\}", re.DOTALL)
 # Structured log helpers
 # ---------------------------------------------------------------------------
 
-def log_start(task: str, model: str) -> None:
-    print(f"[START] task={task} env={BENCHMARK} model={model}", flush=True)
+def log_start(task: str, defender_model: str, fraudster_model: str) -> None:
+    print(
+        f"[START] task={task} env={BENCHMARK} "
+        f"defender_model={defender_model} fraudster_model={fraudster_model}",
+        flush=True,
+    )
 
 def log_step(
     step: int,
@@ -293,11 +326,15 @@ def _build_fraudster_message(step: int, obs: FraudObservation) -> str:
 
 async def run_episode(
     env: FraudEnvClient,
-    llm: OpenAI,
+    defender_llm: OpenAI,
+    fraudster_llm: OpenAI,
     task_name: str,
 ) -> Tuple[bool, int, float]:
     """
     Run one episode using the turn-based protocol.
+
+    Each agent (defender, fraudster) uses its own OpenAI client so that
+    different models, endpoints, or API keys can be configured per-role.
 
     Round structure:
       1. Fraudster receives its obs → sends fraudster action.
@@ -338,8 +375,8 @@ async def run_episode(
 
             frd_response = ""
             try:
-                completion = llm.chat.completions.create(
-                    model=MODEL_NAME,
+                completion = fraudster_llm.chat.completions.create(
+                    model=FRAUDSTER_MODEL_NAME,
                     messages=[
                         {"role": "system", "content": _FRAUDSTER_SYSTEM},
                         {"role": "user",   "content": _build_fraudster_message(
@@ -377,8 +414,8 @@ async def run_episode(
 
             def_response = ""
             try:
-                completion = llm.chat.completions.create(
-                    model=MODEL_NAME,
+                completion = defender_llm.chat.completions.create(
+                    model=DEFENDER_MODEL_NAME,
                     messages=[
                         {"role": "system", "content": _DEFENDER_SYSTEM},
                         {"role": "user",   "content": _build_defender_message(
@@ -458,22 +495,40 @@ async def run_episode(
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
-    if not API_KEY:
-        raise EnvironmentError("HF_TOKEN or API_KEY must be set.")
-    if not MODEL_NAME:
-        raise EnvironmentError("MODEL_NAME must be set.")
+    if not DEFENDER_API_KEY:
+        raise EnvironmentError(
+            "No API key found for the defender. "
+            "Set DEFENDER_API_KEY or the shared HF_TOKEN / API_KEY."
+        )
+    if not FRAUDSTER_API_KEY:
+        raise EnvironmentError(
+            "No API key found for the fraudster. "
+            "Set FRAUDSTER_API_KEY or the shared HF_TOKEN / API_KEY."
+        )
 
-    llm = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
-    env = FraudEnvClient(base_url=ENV_URL)
+    # Each agent gets its own OpenAI-compatible client so models, endpoints,
+    # and keys can differ independently.
+    defender_llm  = OpenAI(base_url=DEFENDER_API_BASE_URL,  api_key=DEFENDER_API_KEY)
+    fraudster_llm = OpenAI(base_url=FRAUDSTER_API_BASE_URL, api_key=FRAUDSTER_API_KEY)
+    env           = FraudEnvClient(base_url=ENV_URL)
+
+    print(f"Defender  model : {DEFENDER_MODEL_NAME}  ({DEFENDER_API_BASE_URL})")
+    print(f"Fraudster model : {FRAUDSTER_MODEL_NAME}  ({FRAUDSTER_API_BASE_URL})")
 
     families = [t for t in VALID_TASK_NAMES if t != "random"]
 
     async with env:
         for task_name in families:
-            log_start(task=task_name, model=MODEL_NAME)
+            log_start(
+                task=task_name,
+                defender_model=DEFENDER_MODEL_NAME,
+                fraudster_model=FRAUDSTER_MODEL_NAME,
+            )
             success, steps, score = False, 0, 0.0
             try:
-                success, steps, score = await run_episode(env, llm, task_name)
+                success, steps, score = await run_episode(
+                    env, defender_llm, fraudster_llm, task_name
+                )
             except Exception as exc:
                 print(f"  [FATAL] task={task_name} crashed: {exc}", flush=True)
             finally:
