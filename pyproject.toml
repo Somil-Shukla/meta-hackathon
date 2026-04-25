@@ -18,6 +18,8 @@ dependencies = [
     "python-dotenv>=1.0.0",
     # LLM client (inference.py)
     "openai>=1.0.0",
+    # Sync HTTP client (train_grpo.py → server)
+    "requests>=2.31.0",
     # RL / training
     "torch>=2.0.0",
     # Utilities
