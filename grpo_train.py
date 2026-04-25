@@ -411,83 +411,94 @@ def _run_single_episode(
         if obs.done:
             break
 
-        # ── Build the prompt for the model-being-trained ─────────────────────
+        # ── Correct turn-based half-step sequencing ───────────────────────────
+        # The environment's protocol requires fraudster to act FIRST (half-step 1),
+        # then the defender (half-step 2, which triggers rewards + transition).
+        # After reset(), current_agent="fraudster", so defenders must wait for
+        # the fraudster to move before they see a populated defender observation.
+
         if agent == "defender":
+            # Half-step 1: baseline fraudster advances the world
+            if obs.current_agent == "fraudster":
+                frd_str, frd_target = fraudster_baseline.select_action(
+                    obs.fraudster_obs,
+                    obs.available_fraudster_actions,
+                    obs.fraudster_action_targets,
+                )
+                obs = env.step(FraudAction(
+                    fraudster_action=FraudsterActionType(frd_str),
+                    fraudster_target=frd_target,
+                ))
+                if obs.done:
+                    break
+
+            # Half-step 2: model picks the defender action from the defender obs
             user_msg = _build_defender_message(step, obs)
-        else:
-            user_msg = _build_fraudster_message(step, obs)
-
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": user_msg},
-        ]
-
-        # ── Generate ONE completion with the current policy ───────────────────
-        # generate_rollout_completions generates num_generations completions;
-        # for the sequential episode we use the first (greedy) one to advance
-        # the environment.  All completions are returned to TRL for scoring.
-        rollout = generate_rollout_completions(trainer, [messages])
-
-        # Use the first completion to step the environment
-        text = (
-            rollout["text"][0]
-            if isinstance(rollout.get("text"), list)
-            else rollout.get("text", "")
-        )
-
-        # ── Parse the model's action ──────────────────────────────────────────
-        if agent == "defender":
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_msg},
+            ]
+            rollout    = generate_rollout_completions(trainer, [messages])
+            text       = rollout["text"][0] if isinstance(rollout.get("text"), list) else rollout.get("text", "")
             action_str, target, is_json, is_legal = _parse_defender_action(text, obs)
-        else:
-            action_str, target, is_json, is_legal = _parse_fraudster_action(text, obs)
-
-        ep_format_valid += float(is_json)
-        ep_action_legal += float(is_legal)
-
-        # ── Build combined FraudAction with the fixed opponent ────────────────
-        if agent == "defender":
-            frd_str, frd_target = fraudster_baseline.select_action(
-                obs.fraudster_obs,
-                obs.available_fraudster_actions,
-                obs.fraudster_action_targets,
-            )
-            action = FraudAction(
+            obs = env.step(FraudAction(
                 defender_action=DefenderActionType(action_str),
                 defender_target=target,
-                fraudster_action=FraudsterActionType(frd_str),
-                fraudster_target=frd_target,
-            )
-        else:
+            ))
+            step_reward = (obs.defender_reward or 0.0)
+
+        else:  # agent == "fraudster"
+            # Half-step 1: model picks the fraudster action
+            user_msg = _build_fraudster_message(step, obs)
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_msg},
+            ]
+            rollout    = generate_rollout_completions(trainer, [messages])
+            text       = rollout["text"][0] if isinstance(rollout.get("text"), list) else rollout.get("text", "")
+            action_str, target, is_json, is_legal = _parse_fraudster_action(text, obs)
+            obs = env.step(FraudAction(
+                fraudster_action=FraudsterActionType(action_str),
+                fraudster_target=target,
+            ))
+            if obs.done:
+                step_reward = (obs.fraudster_reward or 0.0)
+                ep_reward       += step_reward
+                ep_format_valid += float(is_json)
+                ep_action_legal += float(is_legal)
+                n_steps         += 1
+                if "prompt_ids"     in rollout and rollout["prompt_ids"]     is not None:
+                    step_prompt_ids.append(rollout["prompt_ids"])
+                if "completion_ids" in rollout and rollout["completion_ids"] is not None:
+                    step_completion_ids.append(rollout["completion_ids"])
+                if "logprobs"       in rollout and rollout["logprobs"]       is not None:
+                    step_logprobs.append(rollout["logprobs"])
+                break
+
+            # Half-step 2: baseline defender responds and triggers reward
             def_str, def_target = defender_baseline.select_action(
                 obs.defender_obs,
                 obs.available_defender_actions,
                 obs.defender_action_targets,
             )
-            action = FraudAction(
+            obs = env.step(FraudAction(
                 defender_action=DefenderActionType(def_str),
                 defender_target=def_target,
-                fraudster_action=FraudsterActionType(action_str),
-                fraudster_target=target,
-            )
+            ))
+            step_reward = (obs.fraudster_reward or 0.0)
 
-        # ── Step the environment ──────────────────────────────────────────────
-        obs = env.step(action)
-
-        step_reward = (
-            obs.defender_reward if agent == "defender" else obs.fraudster_reward
-        ) or 0.0
-        ep_reward += step_reward
+        ep_reward       += step_reward
+        ep_format_valid += float(is_json)
+        ep_action_legal += float(is_legal)
+        n_steps         += 1
 
         # ── Accumulate trajectory tensors ─────────────────────────────────────
-        # rollout tensors shape: (num_gen, seq_len) — we keep all gens
-        if "prompt_ids" in rollout and rollout["prompt_ids"] is not None:
+        if "prompt_ids"     in rollout and rollout["prompt_ids"]     is not None:
             step_prompt_ids.append(rollout["prompt_ids"])
         if "completion_ids" in rollout and rollout["completion_ids"] is not None:
             step_completion_ids.append(rollout["completion_ids"])
-        if "logprobs" in rollout and rollout["logprobs"] is not None:
+        if "logprobs"       in rollout and rollout["logprobs"]       is not None:
             step_logprobs.append(rollout["logprobs"])
-
-        n_steps += 1
 
     # Final state info (used for evasion reward)
     final_alert = 0.0
