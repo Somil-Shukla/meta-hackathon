@@ -1,49 +1,56 @@
 """
-train_grpo.py — GRPO Training via HTTP Environment Server
-==========================================================
+train_grpo.py — GRPO Training via HTTP Environment Server  (TRL 1.2.0+)
+========================================================================
 
-Bridges the two previously disconnected systems:
+Connects the two previously disconnected systems:
 
-  SYSTEM 1  server/app.py    FraudEnvironment exposed over HTTP (/reset, /step)
-  SYSTEM 2  grpo_train.py    TRL GRPOTrainer logic (reward fns, parsers, prompts)
+  SYSTEM 1  server/app.py   FraudEnvironment over HTTP (/reset, /step)
+  SYSTEM 2  grpo_train.py   reward functions, parsers, system prompts
 
-  THIS FILE connects them:
+  THIS FILE bridges them:
 
     TRL GRPOTrainer  (LoRA on Qwen2.5-1.5B-Instruct by default)
-      └─ make_rollout_func_http()   ← custom rollout function
-           └─ SyncFraudEnvClient    ← blocking HTTP POST /reset, /step
-                └─ server/app.py    ← FraudEnvironment simulation
+      └─ rollout_func(prompts, trainer)     ← TRL 1.2.0 signature
+           └─ SyncFraudEnvClient            ← blocking HTTP POST /reset, /step
+                └─ server/app.py            ← FraudEnvironment simulation
 
-Key improvements over grpo_train.py:
-  1. Server-backed environment — every rollout goes through the HTTP API so
-     the same server used for inference/eval is also used during training.
-  2. Correct turn-based protocol — fraudster ALWAYS acts first (half-step),
-     then the defender (half-step with rewards).  grpo_train.py's
-     _run_single_episode built a defender prompt from the post-reset obs
-     (current_agent="fraudster") before the fraudster had moved; fixed here.
-  3. LoRA adapters via ``peft`` — only the adapter weights are trained and
-     saved, not the full model (~1 % of parameters for rank-16 LoRA).
+Key design decisions
+--------------------
+* rollout_func uses the TRL 1.2.0 signature ``(prompts, trainer)`` — not the
+  old 6-argument form and does NOT use the removed
+  ``generate_rollout_completions`` private API.
+
+* model.generate() is called directly for each model action, with
+  output_scores=True so per-token logprobs can be computed inline.
+
+* For multi-step episodes the "completion" returned to TRL is the
+  concatenation of ALL action token sequences from every step of the episode.
+  The "prompt" is fixed to the first step's observation message.
+  This gives TRL's GRPO objective a signal from all actions, not just the
+  first one, while avoiding the complexity of interleaved obs/action masking.
+
+* LoRA adapters are applied via ``peft`` — only ~1 % of parameters are
+  trained and saved.  Full fine-tune falls back automatically if peft is
+  absent.
 
 Prerequisites:
-    pip install trl>=0.12.0 transformers peft datasets requests
+    pip install trl>=1.2.0 transformers peft accelerate datasets requests
 
 Quick-start:
     # Terminal 1 — start the environment server
-    uv run server
-    # (or)  python -m scam_detection.server.app
+    uv run server                             # or: python -m scam_detection.server.app
 
-    # Terminal 2 — train the defender
+    # Terminal 2 — train the defender (Qwen2.5-1.5B-Instruct default)
     python train_grpo.py --agent defender
 
-    # Terminal 2 — train the fraudster on a specific task
-    python train_grpo.py --agent fraudster --task mule_cashout \\
-        --model Qwen/Qwen2.5-1.5B-Instruct --env-url http://localhost:8000
+    # Terminal 2 — train fraudster on a specific fraud family
+    python train_grpo.py --agent fraudster --task mule_cashout
 
-    # Load the saved adapter after training
+    # Load the saved LoRA adapter after training
     from peft import PeftModel
     from transformers import AutoModelForCausalLM
-    model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct")
-    model = PeftModel.from_pretrained(model, "outputs/defender")
+    base  = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct")
+    model = PeftModel.from_pretrained(base, "outputs/defender")
 """
 from __future__ import annotations
 
@@ -70,18 +77,17 @@ except ImportError:
 
 try:
     from trl import GRPOConfig, GRPOTrainer
-    from trl.trainer.grpo_trainer import generate_rollout_completions
     _TRL_AVAILABLE = True
 except ImportError:
     _TRL_AVAILABLE = False
-    print("[WARNING] trl not installed.  Install: pip install trl>=0.12.0 transformers datasets")
+    print("[WARNING] trl not installed.  Install: pip install trl>=1.2.0 transformers datasets")
 
 try:
     from peft import LoraConfig, TaskType
     _PEFT_AVAILABLE = True
 except ImportError:
     _PEFT_AVAILABLE = False
-    print("[WARNING] peft not installed.  Install: pip install peft  (LoRA will be skipped)")
+    print("[WARNING] peft not installed.  LoRA will be skipped.  Install: pip install peft")
 
 try:
     from datasets import Dataset as _HFDataset
@@ -91,7 +97,7 @@ except ImportError:
     def _make_hf_dataset(rows: list):  # type: ignore[misc]
         return rows
 
-# ── Environment types + reusable helpers from grpo_train.py ─────────────────
+# ── Environment types + reusable helpers ─────────────────────────────────────
 try:
     from scam_detection.baseline_detector import BaselineRuleDetector
     from scam_detection.constants import DEFAULT_MAX_STEPS, VALID_TASK_NAMES
@@ -132,30 +138,21 @@ DEFAULT_MODEL = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-1.5B-Instruct")
 
 
 # ---------------------------------------------------------------------------
-# Synchronous HTTP client for the FraudEnvironment server
+# Synchronous HTTP client
 # ---------------------------------------------------------------------------
 
 class SyncFraudEnvClient:
     """
-    Blocking HTTP wrapper around ``server/app.py``'s /reset and /step endpoints.
+    Blocking HTTP wrapper around server/app.py's /reset and /step endpoints.
 
     Uses ``requests`` (not asyncio) so it can be called directly from TRL's
-    rollout_func without event-loop conflicts.  Each worker creates its own
-    instance; the underlying ``requests.Session`` handles connection pooling.
-
-    Protocol (mirrors FraudEnvironment's internal logic):
-      POST /reset  →  fraudster observation   (current_agent="fraudster")
-      POST /step   →  defender observation    (current_agent="defender",  no reward)
-      POST /step   →  next fraudster obs      (current_agent="fraudster", rewards set)
-      … repeat until done=True
+    synchronous rollout_func without event-loop conflicts.
     """
 
     def __init__(self, base_url: str = "http://localhost:8000", timeout: int = 30):
         self.base_url = base_url.rstrip("/")
         self.timeout  = timeout
         self._session = requests.Session()
-
-    # ---------------------------------------------------------------- reset --
 
     def reset(self, task_name: str = "random", seed: Optional[int] = None) -> FraudObservation:
         payload: Dict[str, Any] = {"task_name": task_name}
@@ -165,13 +162,7 @@ class SyncFraudEnvClient:
         r.raise_for_status()
         return _parse_obs(r.json())
 
-    # ---------------------------------------------------------------- step ---
-
     def step(self, action: FraudAction) -> Tuple[FraudObservation, bool]:
-        """
-        Send one half-step action.  The server consumes only the field that
-        matches its current phase (fraudster or defender); the other is ignored.
-        """
         payload: Dict[str, Any] = {
             "defender_action":  action.defender_action.value,
             "fraudster_action": action.fraudster_action.value,
@@ -187,10 +178,7 @@ class SyncFraudEnvClient:
         done = bool(data.get("done", obs.done or False))
         return obs, done
 
-    # ---------------------------------------------------------------- utils --
-
     def ping(self) -> bool:
-        """Return True if the server is reachable and healthy."""
         try:
             return self._session.get(f"{self.base_url}/schema", timeout=5).status_code == 200
         except requests.exceptions.ConnectionError:
@@ -207,15 +195,8 @@ class SyncFraudEnvClient:
 
 
 def _parse_obs(data: Dict[str, Any]) -> FraudObservation:
-    """
-    Deserialise a /reset or /step JSON response into a FraudObservation.
-
-    /reset returns the observation at the top level.
-    /step  wraps it under an "observation" key.
-    """
     obs_raw = data.get("observation", data)
     current_agent = obs_raw.get("current_agent")
-    # Heuristic fallback: infer current_agent from which partial obs is populated
     if current_agent is None and not obs_raw.get("episode_done"):
         if obs_raw.get("fraudster_obs") is not None and obs_raw.get("defender_obs") is None:
             current_agent = "fraudster"
@@ -244,46 +225,127 @@ def _parse_obs(data: Dict[str, Any]) -> FraudObservation:
 
 
 # ---------------------------------------------------------------------------
-# Single-episode runner — correct turn-based protocol + HTTP server
+# Model generation helper  (replaces removed generate_rollout_completions)
 # ---------------------------------------------------------------------------
 
-def _run_single_episode_http(
-    trainer,
-    env: SyncFraudEnvClient,
-    agent: str,
-    system_prompt: str,
-    task_name: str,
-    seed: int,
-    max_turns: int,
-    defender_baseline: BaselineRuleDetector,
-    fraudster_baseline: BaselineFraudster,
-) -> Dict[str, Any]:
+def _generate_action(model, tokenizer, messages: List[Dict], max_new_tokens: int = 128) -> Dict:
     """
-    Play one complete episode via the HTTP server.
+    Run ``model.generate()`` for one observation → action step.
 
-    The server enforces the alternating half-step protocol automatically:
-      reset()             → current_agent="fraudster"  (fraudster obs)
-      step(frd_action)    → current_agent="defender"   (defender obs, no reward)
-      step(def_action)    → current_agent="fraudster"  (fraudster obs + rewards)
-      …
+    Returns a dict with:
+      prompt_ids     List[int]   tokenized prompt (system + observation)
+      completion_ids List[int]   generated action tokens
+      logprobs       List[float] per-token sampling log-probabilities
+      text           str         decoded action text
+    """
+    device = next(model.parameters()).device
 
-    For DEFENDER training:
-      half-step 1: baseline fraudster fills the fraudster slot.
-      half-step 2: model fills the defender slot → reward = obs.defender_reward.
+    # Apply chat template to format the conversation
+    try:
+        prompt_text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,     # Qwen3 / thinking models
+        )
+    except TypeError:
+        prompt_text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
 
-    For FRAUDSTER training:
-      half-step 1: model fills the fraudster slot.
-      half-step 2: baseline defender fills the defender slot → reward = obs.fraudster_reward.
+    inputs = tokenizer(
+        prompt_text, return_tensors="pt", truncation=True, max_length=2048
+    ).to(device)
+    prompt_len = inputs["input_ids"].shape[1]
 
-    Returns a dict with per-step tensor lists and per-episode scalars for
-    GRPO's reward functions.
+    # Temporarily switch to eval mode for generation
+    was_training = model.training
+    model.eval()
+
+    try:
+        with torch.no_grad():
+            output = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=0.7,
+                pad_token_id=tokenizer.eos_token_id or tokenizer.pad_token_id or 0,
+                return_dict_in_generate=True,
+                output_scores=True,
+            )
+    finally:
+        if was_training:
+            model.train()
+
+    full_ids        = output.sequences[0].tolist()
+    prompt_ids      = full_ids[:prompt_len]
+    completion_ids  = full_ids[prompt_len:]
+
+    # Per-token log-probabilities from the generation scores
+    logprobs: List[float] = []
+    for step_idx, step_scores in enumerate(output.scores or []):
+        if step_idx < len(completion_ids):
+            lp = torch.log_softmax(step_scores[0], dim=-1)
+            logprobs.append(lp[completion_ids[step_idx]].item())
+    # Safety pad
+    if len(logprobs) < len(completion_ids):
+        logprobs += [0.0] * (len(completion_ids) - len(logprobs))
+
+    text = tokenizer.decode(completion_ids, skip_special_tokens=True)
+    return {
+        "prompt_ids":     prompt_ids,
+        "completion_ids": completion_ids,
+        "logprobs":       logprobs,
+        "text":           text,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Episode runner — correct turn-based protocol + HTTP server
+# ---------------------------------------------------------------------------
+
+def _run_episode_http(
+    env:                SyncFraudEnvClient,
+    model,
+    tokenizer,
+    agent:              str,
+    system_prompt:      str,
+    task_name:          str,
+    seed:               int,
+    max_turns:          int,
+    max_new_tokens:     int,
+    defender_baseline:  BaselineRuleDetector,
+    fraudster_baseline: BaselineFraudster,
+) -> Dict:
+    """
+    Play one complete episode via HTTP, generating model actions at each
+    step the agent-under-training must act.
+
+    Turn-based protocol (enforced server-side):
+      reset()           → current_agent="fraudster"  (obs, no reward)
+      step(frd_action)  → current_agent="defender"   (obs, no reward)
+      step(def_action)  → current_agent="fraudster"  (obs + rewards)
+      … repeat until done=True
+
+    Multi-step trajectory encoding
+    --------------------------------
+    The "prompt" returned to TRL is the FIRST step's observation message.
+    The "completion" is the concatenation of ALL action token sequences
+    from every step where the model acted.
+    The "logprobs" are the corresponding per-token sampling log-probs.
+
+    TRL's GRPO objective thus sees the whole episode as one long action
+    sequence and updates all action tokens proportionally to the total
+    episode reward.
     """
     obs = env.reset(task_name=task_name, seed=seed)
     done = False
 
-    step_prompt_ids:     List = []
-    step_completion_ids: List = []
-    step_logprobs:       List = []
+    first_prompt_ids: Optional[List[int]] = None
+    all_completion_ids: List[int]  = []
+    all_logprobs:       List[float] = []
 
     ep_reward       = 0.0
     ep_format_valid = 0.0
@@ -310,14 +372,15 @@ def _run_single_episode_http(
                 if done or obs.done:
                     break
 
-            # Half-step 2: model picks the defender action
+            # Half-step 2: model generates the defender action
             messages = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user",   "content": _build_defender_message(turn, obs)},
             ]
-            rollout = generate_rollout_completions(trainer, [messages])
-            text    = _first_text(rollout)
-            action_str, target, is_json, is_legal = _parse_defender_action(text, obs)
+            gen = _generate_action(model, tokenizer, messages, max_new_tokens)
+            if first_prompt_ids is None:
+                first_prompt_ids = gen["prompt_ids"]
+            action_str, target, is_json, is_legal = _parse_defender_action(gen["text"], obs)
             obs, done = env.step(FraudAction(
                 defender_action=DefenderActionType(action_str),
                 defender_target=target,
@@ -326,29 +389,30 @@ def _run_single_episode_http(
 
         # ── Fraudster training ────────────────────────────────────────────
         else:
-            # Half-step 1: model picks the fraudster action
+            # Half-step 1: model generates the fraudster action
             messages = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user",   "content": _build_fraudster_message(turn, obs)},
             ]
-            rollout = generate_rollout_completions(trainer, [messages])
-            text    = _first_text(rollout)
-            action_str, target, is_json, is_legal = _parse_fraudster_action(text, obs)
+            gen = _generate_action(model, tokenizer, messages, max_new_tokens)
+            if first_prompt_ids is None:
+                first_prompt_ids = gen["prompt_ids"]
+            action_str, target, is_json, is_legal = _parse_fraudster_action(gen["text"], obs)
             obs, done = env.step(FraudAction(
                 fraudster_action=FraudsterActionType(action_str),
                 fraudster_target=target,
             ))
             if done or obs.done:
-                # Episode ended during fraudster half-step (rare; counts this step)
                 step_reward = obs.fraudster_reward or 0.0
+                all_completion_ids.extend(gen["completion_ids"])
+                all_logprobs.extend(gen["logprobs"])
                 ep_reward       += step_reward
                 ep_format_valid += float(is_json)
                 ep_action_legal += float(is_legal)
                 n_steps         += 1
-                _accumulate(rollout, step_prompt_ids, step_completion_ids, step_logprobs)
                 break
 
-            # Half-step 2: baseline defender responds and triggers reward
+            # Half-step 2: baseline defender responds + triggers rewards
             def_str, def_tgt = defender_baseline.select_action(
                 obs.defender_obs,
                 obs.available_defender_actions,
@@ -360,21 +424,30 @@ def _run_single_episode_http(
             ))
             step_reward = obs.fraudster_reward or 0.0
 
-        # ── Accumulate (both agent branches reach here unless they broke early)
+        # Accumulate (both branches reach here unless they broke early)
+        all_completion_ids.extend(gen["completion_ids"])
+        all_logprobs.extend(gen["logprobs"])
         ep_reward       += step_reward
         ep_format_valid += float(is_json)
         ep_action_legal += float(is_legal)
         n_steps         += 1
-        _accumulate(rollout, step_prompt_ids, step_completion_ids, step_logprobs)
+
+    # Edge-case: episode ended before the model ever acted
+    if not all_completion_ids:
+        dummy = '{"action": "do_nothing", "target": null}'
+        dummy_ids = tokenizer.encode(dummy, add_special_tokens=False)
+        first_prompt_ids   = first_prompt_ids or []
+        all_completion_ids = dummy_ids
+        all_logprobs       = [0.0] * len(dummy_ids)
 
     final_alert = 0.0
     if obs.fraudster_obs:
         final_alert = float(obs.fraudster_obs.get("alert_level", 0.0))
 
     return {
-        "prompt_ids":     step_prompt_ids,
-        "completion_ids": step_completion_ids,
-        "logprobs":       step_logprobs,
+        "prompt_ids":     first_prompt_ids or [],
+        "completion_ids": all_completion_ids,
+        "logprobs":       all_logprobs,
         "episode_reward": ep_reward,
         "format_valid":   ep_format_valid / max(1, n_steps),
         "action_legal":   ep_action_legal / max(1, n_steps),
@@ -382,115 +455,104 @@ def _run_single_episode_http(
     }
 
 
-def _first_text(rollout: Dict[str, Any]) -> str:
-    """Extract the first completion string from generate_rollout_completions output."""
-    t = rollout.get("text", "")
-    return t[0] if isinstance(t, list) else str(t)
-
-
-def _accumulate(rollout, prompt_ids_list, completion_ids_list, logprobs_list) -> None:
-    """Append per-step tensors from a generate_rollout_completions result."""
-    if rollout.get("prompt_ids")     is not None:
-        prompt_ids_list.append(rollout["prompt_ids"])
-    if rollout.get("completion_ids") is not None:
-        completion_ids_list.append(rollout["completion_ids"])
-    if rollout.get("logprobs")       is not None:
-        logprobs_list.append(rollout["logprobs"])
-
-
 # ---------------------------------------------------------------------------
-# Rollout function factory — HTTP edition
+# Rollout function factory — TRL 1.2.0 API: (prompts, trainer)
 # ---------------------------------------------------------------------------
 
 def make_rollout_func_http(
-    env_url: str,
-    agent: str,
+    env_url:       str,
+    agent:         str,
     system_prompt: str,
-    max_turns: int = DEFAULT_MAX_STEPS,
+    max_turns:     int = DEFAULT_MAX_STEPS,
+    max_new_tokens: int = 128,
 ):
     """
-    Return a ``rollout_func`` for TRL's GRPOTrainer that drives the HTTP server.
+    Return a ``rollout_func`` compatible with TRL 1.2.0's GRPOTrainer.
 
-    Each call plays ``num_generations`` independent episodes — each with a
-    different random seed — so GRPO sees a group of trajectories with naturally
-    varying rewards to compute group-relative advantages from.
+    The returned function signature is ``(prompts, trainer)`` as required by
+    TRL 1.2.0.  It plays ``num_generations`` independent episodes per prompt
+    against the HTTP server, each with a different seed so GRPO sees varied
+    rewards within the group to compute relative advantages from.
 
     Parameters
     ----------
     env_url:
-        URL of the running FraudEnvironment server (e.g. "http://localhost:8000").
+        URL of the running FraudEnvironment server.
     agent:
         "defender" or "fraudster".
     system_prompt:
-        System-role message injected at every step of every episode.
+        System-role message injected at every episode step.
     max_turns:
         Maximum full rounds per episode.
+    max_new_tokens:
+        Maximum new tokens the model generates per action step.
     """
     defender_baseline  = BaselineRuleDetector()
     fraudster_baseline = BaselineFraudster()
 
-    def rollout_func(trainer, _env, tokenizer, prompt, _system_prompt, _max_turns):
+    def rollout_func(prompts: List[Dict], trainer) -> Dict:
         """
-        Play num_generations episodes and return stacked trajectory tensors.
+        TRL 1.2.0 rollout_func signature: (prompts, trainer).
 
-        Signature matches TRL's GRPOTrainer rollout_func contract.
+        ``prompts`` is the per-process slice of the training batch (may contain
+        multiple rows).  For each row we play ``num_generations`` independent
+        episodes and return the concatenated results.
+
+        Required return keys: "prompt_ids", "completion_ids", "logprobs"
+        Extra keys are forwarded to the reward functions.
         """
-        num_gens  = trainer.args.num_generations
-        task_name = prompt.get("task_name", "random")
-        base_seed = prompt.get("seed", random.randint(0, 2 ** 20))
+        num_gens   = trainer.args.num_generations
+        model      = trainer.model
+        tokenizer  = trainer.processing_class
 
-        # Each call gets a fresh session (thread-safe, connection-pooled)
+        all_prompt_ids:     List[List[int]]   = []
+        all_completion_ids: List[List[int]]   = []
+        all_logprobs:       List[List[float]] = []
+        all_ep_rewards:     List[float]       = []
+        all_format_valids:  List[float]       = []
+        all_action_legals:  List[float]       = []
+        all_alert_levels:   List[float]       = []
+
         with SyncFraudEnvClient(base_url=env_url) as env:
-            episodes = [
-                _run_single_episode_http(
-                    trainer=trainer,
-                    env=env,
-                    agent=agent,
-                    system_prompt=system_prompt,
-                    task_name=task_name,
-                    seed=base_seed + gen_idx,
-                    max_turns=max_turns,
-                    defender_baseline=defender_baseline,
-                    fraudster_baseline=fraudster_baseline,
-                )
-                for gen_idx in range(num_gens)
-            ]
+            for prompt in prompts:
+                task_name = prompt.get("task_name", "random")
+                base_seed = prompt.get("seed", random.randint(0, 2 ** 20))
+
+                for gen_idx in range(num_gens):
+                    ep = _run_episode_http(
+                        env=env,
+                        model=model,
+                        tokenizer=tokenizer,
+                        agent=agent,
+                        system_prompt=system_prompt,
+                        task_name=task_name,
+                        seed=base_seed + gen_idx,
+                        max_turns=max_turns,
+                        max_new_tokens=max_new_tokens,
+                        defender_baseline=defender_baseline,
+                        fraudster_baseline=fraudster_baseline,
+                    )
+                    all_prompt_ids.append(ep["prompt_ids"])
+                    all_completion_ids.append(ep["completion_ids"])
+                    all_logprobs.append(ep["logprobs"])
+                    all_ep_rewards.append(ep["episode_reward"])
+                    all_format_valids.append(ep["format_valid"])
+                    all_action_legals.append(ep["action_legal"])
+                    all_alert_levels.append(ep["final_alert"])
 
         return {
-            "prompt_ids":     _stack_steps([ep["prompt_ids"]     for ep in episodes]),
-            "completion_ids": _stack_steps([ep["completion_ids"] for ep in episodes]),
-            "logprobs":       _stack_steps([ep["logprobs"]       for ep in episodes]),
-            # Per-generation scalars consumed by the reward functions
-            "episode_rewards": [ep["episode_reward"] for ep in episodes],
-            "format_valids":   [ep["format_valid"]   for ep in episodes],
-            "action_legals":   [ep["action_legal"]   for ep in episodes],
-            "alert_levels":    [ep["final_alert"]    for ep in episodes],
+            # Required by TRL 1.2.0 rollout_func contract
+            "prompt_ids":     all_prompt_ids,
+            "completion_ids": all_completion_ids,
+            "logprobs":       all_logprobs,
+            # Extra fields forwarded to reward functions via **kwargs
+            "episode_rewards": all_ep_rewards,
+            "format_valids":   all_format_valids,
+            "action_legals":   all_action_legals,
+            "alert_levels":    all_alert_levels,
         }
 
     return rollout_func
-
-
-def _stack_steps(tensor_lists_per_gen: List[List]) -> Optional[Any]:
-    """
-    Concatenate per-step tensors within each generation, then stack across gens.
-
-    Each generation produces a list of tensors (one per step the model acted).
-    We cat those into a single sequence per generation, then stack all gens
-    into one (num_gens, total_len) tensor that TRL expects.
-    """
-    if not _TORCH_AVAILABLE:
-        return None
-    rows = []
-    for step_tensors in tensor_lists_per_gen:
-        if step_tensors:
-            rows.append(torch.cat(step_tensors, dim=-1))
-        else:
-            rows.append(torch.zeros(1, 1, dtype=torch.long))
-    if not rows:
-        return torch.zeros(len(tensor_lists_per_gen), 1, dtype=torch.long)
-    max_len = max(r.shape[-1] for r in rows)
-    padded  = [F.pad(r, (0, max_len - r.shape[-1])) for r in rows]
-    return torch.cat(padded, dim=0)
 
 
 # ---------------------------------------------------------------------------
@@ -508,8 +570,8 @@ def train(
     num_generations: int   = 4,
     batch_size:      int   = 1,
     grad_accum:      int   = 16,
-    max_prompt_len:  int   = 2048,
-    max_comp_len:    int   = 128,
+    max_comp_len:    int   = 256,
+    max_new_tokens:  int   = 128,
     lora_rank:       int   = 16,
     lora_alpha:      int   = 32,
     lora_dropout:    float = 0.05,
@@ -517,22 +579,30 @@ def train(
     output_dir:      str   = "outputs",
 ) -> None:
     """
-    Train a fraud detection LLM agent using GRPO, driven by the HTTP server.
+    Train a fraud detection LLM using GRPO, driven by the HTTP server.
 
     The LoRA adapter is saved to ``<output_dir>/<agent>/``.  Load it later::
 
         from peft import PeftModel
         from transformers import AutoModelForCausalLM
-        base = AutoModelForCausalLM.from_pretrained(model_name)
-        model = PeftModel.from_pretrained(base, f"{output_dir}/{agent}")
+        base  = AutoModelForCausalLM.from_pretrained(model_name)
+        model = PeftModel.from_pretrained(base, f"outputs/{agent}")
+
+    GPU requirement
+    ---------------
+    Training a 1.5B+ parameter model requires a GPU with at least 16 GB VRAM
+    (Qwen2.5-1.5B with LoRA rank-16 needs ~8 GB).  On CPU only, this will be
+    extremely slow.  For inference/debugging on CPU, use inference.py instead.
     """
     if not _TRL_AVAILABLE:
         raise ImportError(
             "trl is required.\n"
-            "Install with: pip install trl>=0.12.0 transformers datasets"
+            "Install with: pip install trl>=1.2.0 transformers datasets"
         )
     if agent not in ("defender", "fraudster"):
         raise ValueError(f"agent must be 'defender' or 'fraudster', got '{agent}'")
+    if not _TORCH_AVAILABLE:
+        raise ImportError("torch is required for training.  Install: pip install torch")
 
     # ── Server health check ────────────────────────────────────────────────
     print(f"Checking environment server at {env_url} … ", end="", flush=True)
@@ -546,6 +616,13 @@ def train(
                 "  # or:  python -m scam_detection.server.app"
             )
     print("OK")
+
+    # ── Warn if no GPU ─────────────────────────────────────────────────────
+    if not torch.cuda.is_available():
+        print(
+            "\n[WARNING] No CUDA GPU detected — training will be very slow on CPU.\n"
+            "          For a 1.5B model with LoRA, a 16 GB GPU is recommended.\n"
+        )
 
     system_prompt = _DEFENDER_SYSTEM if agent == "defender" else _FRAUDSTER_SYSTEM
     reward_funcs  = _get_reward_funcs(agent)
@@ -568,7 +645,6 @@ def train(
             r=lora_rank,
             lora_alpha=lora_alpha,
             lora_dropout=lora_dropout,
-            # Standard attention + MLP modules for Qwen2.5 / LLaMA family
             target_modules=[
                 "q_proj", "k_proj", "v_proj", "o_proj",
                 "gate_proj", "up_proj", "down_proj",
@@ -576,24 +652,24 @@ def train(
             bias="none",
             task_type=TaskType.CAUSAL_LM,
         )
-        print(f"LoRA  r={lora_rank}  alpha={lora_alpha}  "
-              f"modules=q/k/v/o/gate/up/down_proj\n")
+        print(f"LoRA  r={lora_rank}  alpha={lora_alpha}  modules=q/k/v/o/gate/up/down_proj\n")
     else:
-        print("[WARNING] peft not installed — full fine-tune (no LoRA).\n"
-              "          Install: pip install peft\n")
+        print("[WARNING] peft not installed — full fine-tune (no LoRA).\n")
 
-    # ── Dataset — one row per (task_name, seed) pair ───────────────────────
+    # ── Dataset ────────────────────────────────────────────────────────────
     dataset = build_training_dataset(task=task, n_samples=n_samples)
 
-    # ── Rollout function — HTTP edition ────────────────────────────────────
+    # ── Rollout function ───────────────────────────────────────────────────
     rollout_func = make_rollout_func_http(
         env_url=env_url,
         agent=agent,
         system_prompt=system_prompt,
         max_turns=DEFAULT_MAX_STEPS,
+        max_new_tokens=max_new_tokens,
     )
 
     # ── GRPOConfig ─────────────────────────────────────────────────────────
+    _no_gpu = not torch.cuda.is_available()
     grpo_config = GRPOConfig(
         output_dir=agent_out_dir,
         num_train_epochs=epochs,
@@ -601,15 +677,16 @@ def train(
         per_device_train_batch_size=batch_size,
         gradient_accumulation_steps=grad_accum,
         num_generations=num_generations,
-        max_prompt_length=max_prompt_len,
         max_completion_length=max_comp_len,
-        gradient_checkpointing=True,
-        use_vllm=use_vllm,
-        vllm_mode="colocate" if use_vllm else None,
-        vllm_gpu_memory_utilization=0.3 if use_vllm else None,
-        logging_steps=5,
+        gradient_checkpointing=not _no_gpu,  # not supported on CPU
+        use_cpu=_no_gpu,
+        bf16=False,
+        fp16=False,
+        use_vllm=use_vllm and not _no_gpu,
+        vllm_gpu_memory_utilization=0.3 if (use_vllm and not _no_gpu) else None,
+        logging_steps=1,
         save_steps=50,
-        report_to="none",       # swap to "wandb" or "trackio" if desired
+        report_to="none",
     )
 
     # ── GRPOTrainer ────────────────────────────────────────────────────────
@@ -627,17 +704,12 @@ def train(
 
     print(f"\nSaving LoRA adapter to {agent_out_dir}/")
     trainer.save_model(agent_out_dir)
-
     print("\nDone.")
-    print(f"\nTo load the trained adapter later:")
+    print(f"\nTo load the trained adapter:")
     print(f"  from peft import PeftModel")
     print(f"  from transformers import AutoModelForCausalLM")
     print(f"  base  = AutoModelForCausalLM.from_pretrained('{model_name}')")
     print(f"  model = PeftModel.from_pretrained(base, '{agent_out_dir}')")
-    print()
-    print("To use it in inference.py, set:")
-    print(f"  DEFENDER_MODEL_NAME='{agent_out_dir}'  (if you trained the defender)")
-    print(f"  DEFENDER_API_BASE_URL='http://localhost:<vllm-port>/v1'")
 
 
 # ---------------------------------------------------------------------------
@@ -649,7 +721,7 @@ def main() -> None:
     _env_url        = os.getenv("ENV_URL",    "http://localhost:8000")
 
     parser = argparse.ArgumentParser(
-        description="GRPO training — drives server/app.py via HTTP, trains LoRA on LLM",
+        description="GRPO training (TRL 1.2.0) — drives server/app.py via HTTP, trains LoRA on LLM",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""
             Quick start
@@ -657,44 +729,41 @@ def main() -> None:
             # Terminal 1 — start the environment server
             uv run server
 
-            # Terminal 2 — train the defender (Qwen2.5-1.5B by default)
+            # Terminal 2 — train the defender
             python train_grpo.py --agent defender
 
-            # Terminal 2 — train the fraudster with a specific task
-            python train_grpo.py --agent fraudster --task mule_cashout
-
-            # After training, run inference with the fine-tuned adapter:
+            # After training, use the adapter in inference.py:
             # Set DEFENDER_MODEL_NAME=outputs/defender in .env
+
+            GPU note
+            --------
+            A 16 GB GPU is recommended for Qwen2.5-1.5B + LoRA rank-16.
+            For CPU-only testing, use a very small --samples value and expect
+            very slow progress.  Use inference.py for CPU-based evaluation.
         """),
     )
-    parser.add_argument(
-        "--agent", required=True, choices=["defender", "fraudster"],
-        help="Which agent to train",
-    )
-    parser.add_argument(
-        "--model", default=_shared_default, metavar="MODEL",
-        help=f"HF model ID or local path (default: {_shared_default})",
-    )
-    parser.add_argument(
-        "--env-url", default=_env_url,
-        help=f"Environment server URL (default: {_env_url})",
-    )
-    parser.add_argument(
-        "--task", default="random", choices=VALID_TASK_NAMES,
-        help="Fraud family to train on (default: random — rotates all families)",
-    )
-    parser.add_argument("--samples",         type=int,   default=200,  help="Dataset size / training episodes (default: 200)")
-    parser.add_argument("--epochs",          type=int,   default=1,    help="Training epochs (default: 1)")
-    parser.add_argument("--lr",              type=float, default=5e-6, help="Learning rate (default: 5e-6)")
-    parser.add_argument("--num-generations", type=int,   default=4,    help="GRPO group size — independent episodes per sample (default: 4)")
-    parser.add_argument("--grad-accum",      type=int,   default=16,   help="Gradient accumulation steps (default: 16)")
-    parser.add_argument("--max-prompt-len",  type=int,   default=2048, help="Max observation prompt tokens (default: 2048)")
-    parser.add_argument("--max-comp-len",    type=int,   default=128,  help="Max action completion tokens (default: 128)")
-    parser.add_argument("--lora-rank",       type=int,   default=16,   help="LoRA rank r (default: 16)")
-    parser.add_argument("--lora-alpha",      type=int,   default=32,   help="LoRA alpha (default: 32)")
-    parser.add_argument("--lora-dropout",    type=float, default=0.05, help="LoRA dropout (default: 0.05)")
-    parser.add_argument("--use-vllm",        action="store_true",      help="Enable vLLM colocate mode (requires GPU + vllm)")
-    parser.add_argument("--output-dir",      default="outputs",        help="Base directory for saved adapters (default: outputs/)")
+    parser.add_argument("--agent",    required=True, choices=["defender", "fraudster"])
+    parser.add_argument("--model",    default=_shared_default, metavar="MODEL",
+                        help=f"HF model ID or local path (default: {_shared_default})")
+    parser.add_argument("--env-url",  default=_env_url,
+                        help=f"Environment server URL (default: {_env_url})")
+    parser.add_argument("--task",     default="random", choices=VALID_TASK_NAMES,
+                        help="Fraud family (default: random — rotates all families)")
+    parser.add_argument("--samples",          type=int,   default=200)
+    parser.add_argument("--epochs",           type=int,   default=1)
+    parser.add_argument("--lr",               type=float, default=5e-6)
+    parser.add_argument("--num-generations",  type=int,   default=4,
+                        help="GRPO group size — episodes per training sample (default: 4)")
+    parser.add_argument("--grad-accum",       type=int,   default=16)
+    parser.add_argument("--max-comp-len",     type=int,   default=256)
+    parser.add_argument("--max-new-tokens",   type=int,   default=128,
+                        help="Max tokens generated per action step (default: 128)")
+    parser.add_argument("--lora-rank",        type=int,   default=16)
+    parser.add_argument("--lora-alpha",       type=int,   default=32)
+    parser.add_argument("--lora-dropout",     type=float, default=0.05)
+    parser.add_argument("--use-vllm",         action="store_true",
+                        help="Enable vLLM colocate mode (requires GPU + vllm)")
+    parser.add_argument("--output-dir",       default="outputs")
     args = parser.parse_args()
 
     train(
@@ -707,8 +776,8 @@ def main() -> None:
         lr=args.lr,
         num_generations=args.num_generations,
         grad_accum=args.grad_accum,
-        max_prompt_len=args.max_prompt_len,
         max_comp_len=args.max_comp_len,
+        max_new_tokens=args.max_new_tokens,
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,

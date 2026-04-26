@@ -113,11 +113,10 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 try:
     from trl import GRPOConfig, GRPOTrainer
-    from trl.trainer.grpo_trainer import generate_rollout_completions
     _TRL_AVAILABLE = True
 except ImportError:
     _TRL_AVAILABLE = False
-    print("[WARNING] trl not installed. Install with: pip install trl>=0.12.0")
+    print("[WARNING] trl not installed. Install with: pip install trl>=1.2.0")
 
 # ---------------------------------------------------------------------------
 # Environment imports
@@ -379,8 +378,72 @@ class BaselineFraudster:
 # Single episode runner (one generation)
 # ---------------------------------------------------------------------------
 
+def _generate_action_inline(model, tokenizer, messages: List[Dict], max_new_tokens: int = 128) -> Dict[str, Any]:
+    """
+    Generate one action step using model.generate() directly.
+
+    Replaces the removed ``generate_rollout_completions`` private API.
+    Returns a dict with prompt_ids (List[int]), completion_ids (List[int]),
+    logprobs (List[float]), and the decoded text string.
+    """
+    if not _TORCH_AVAILABLE:
+        dummy = '{"action": "do_nothing", "target": null}'
+        return {"prompt_ids": [], "completion_ids": [], "logprobs": [], "text": dummy}
+
+    device = next(model.parameters()).device
+
+    try:
+        prompt_text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False,
+        )
+    except TypeError:
+        prompt_text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+
+    inputs    = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=2048).to(device)
+    prompt_len = inputs["input_ids"].shape[1]
+
+    was_training = model.training
+    model.eval()
+    try:
+        with _torch.no_grad():
+            output = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=0.7,
+                pad_token_id=tokenizer.eos_token_id or tokenizer.pad_token_id or 0,
+                return_dict_in_generate=True,
+                output_scores=True,
+            )
+    finally:
+        if was_training:
+            model.train()
+
+    full_ids       = output.sequences[0].tolist()
+    prompt_ids     = full_ids[:prompt_len]
+    completion_ids = full_ids[prompt_len:]
+
+    logprobs: List[float] = []
+    for step_idx, step_scores in enumerate(output.scores or []):
+        if step_idx < len(completion_ids):
+            lp = _torch.log_softmax(step_scores[0], dim=-1)
+            logprobs.append(lp[completion_ids[step_idx]].item())
+    if len(logprobs) < len(completion_ids):
+        logprobs += [0.0] * (len(completion_ids) - len(logprobs))
+
+    return {
+        "prompt_ids":     prompt_ids,
+        "completion_ids": completion_ids,
+        "logprobs":       logprobs,
+        "text":           tokenizer.decode(completion_ids, skip_special_tokens=True),
+    }
+
+
 def _run_single_episode(
-    trainer,
+    model,
+    tokenizer,
     env: FraudEnvironment,
     agent: str,
     system_prompt: str,
@@ -389,18 +452,22 @@ def _run_single_episode(
     max_turns: int,
     defender_baseline: BaselineRuleDetector,
     fraudster_baseline: BaselineFraudster,
+    max_new_tokens: int = 128,
 ) -> Dict[str, Any]:
     """
-    Play one complete episode and collect the generation trajectory.
+    Play one complete episode using the direct FraudEnvironment (no HTTP).
 
-    Returns a dict with prompt_ids, completion_ids, logprobs (as lists of
-    tensors from each step), plus per-episode reward metadata.
+    Returns prompt_ids, completion_ids, and logprobs as List[int]/List[float]
+    (TRL 1.2.0 format — not tensors), plus per-episode reward metadata.
+
+    The "completion" is the concatenation of ALL action token sequences from
+    every step, giving TRL a full episode's worth of gradient signal.
     """
     obs = env.reset(task_name=task_name, seed=seed)
 
-    step_prompt_ids:     List = []
-    step_completion_ids: List = []
-    step_logprobs:       List = []
+    first_prompt_ids: Optional[List[int]] = None
+    all_completion_ids: List[int]  = []
+    all_logprobs:       List[float] = []
 
     ep_reward       = 0.0
     ep_format_valid = 0.0
@@ -410,12 +477,6 @@ def _run_single_episode(
     for step in range(1, max_turns + 1):
         if obs.done:
             break
-
-        # ── Correct turn-based half-step sequencing ───────────────────────────
-        # The environment's protocol requires fraudster to act FIRST (half-step 1),
-        # then the defender (half-step 2, which triggers rewards + transition).
-        # After reset(), current_agent="fraudster", so defenders must wait for
-        # the fraudster to move before they see a populated defender observation.
 
         if agent == "defender":
             # Half-step 1: baseline fraudster advances the world
@@ -433,14 +494,14 @@ def _run_single_episode(
                     break
 
             # Half-step 2: model picks the defender action from the defender obs
-            user_msg = _build_defender_message(step, obs)
             messages = [
                 {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": user_msg},
+                {"role": "user",   "content": _build_defender_message(step, obs)},
             ]
-            rollout    = generate_rollout_completions(trainer, [messages])
-            text       = rollout["text"][0] if isinstance(rollout.get("text"), list) else rollout.get("text", "")
-            action_str, target, is_json, is_legal = _parse_defender_action(text, obs)
+            gen = _generate_action_inline(model, tokenizer, messages, max_new_tokens)
+            if first_prompt_ids is None:
+                first_prompt_ids = gen["prompt_ids"]
+            action_str, target, is_json, is_legal = _parse_defender_action(gen["text"], obs)
             obs = env.step(FraudAction(
                 defender_action=DefenderActionType(action_str),
                 defender_target=target,
@@ -449,30 +510,26 @@ def _run_single_episode(
 
         else:  # agent == "fraudster"
             # Half-step 1: model picks the fraudster action
-            user_msg = _build_fraudster_message(step, obs)
             messages = [
                 {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": user_msg},
+                {"role": "user",   "content": _build_fraudster_message(step, obs)},
             ]
-            rollout    = generate_rollout_completions(trainer, [messages])
-            text       = rollout["text"][0] if isinstance(rollout.get("text"), list) else rollout.get("text", "")
-            action_str, target, is_json, is_legal = _parse_fraudster_action(text, obs)
+            gen = _generate_action_inline(model, tokenizer, messages, max_new_tokens)
+            if first_prompt_ids is None:
+                first_prompt_ids = gen["prompt_ids"]
+            action_str, target, is_json, is_legal = _parse_fraudster_action(gen["text"], obs)
             obs = env.step(FraudAction(
                 fraudster_action=FraudsterActionType(action_str),
                 fraudster_target=target,
             ))
             if obs.done:
                 step_reward = (obs.fraudster_reward or 0.0)
+                all_completion_ids.extend(gen["completion_ids"])
+                all_logprobs.extend(gen["logprobs"])
                 ep_reward       += step_reward
                 ep_format_valid += float(is_json)
                 ep_action_legal += float(is_legal)
                 n_steps         += 1
-                if "prompt_ids"     in rollout and rollout["prompt_ids"]     is not None:
-                    step_prompt_ids.append(rollout["prompt_ids"])
-                if "completion_ids" in rollout and rollout["completion_ids"] is not None:
-                    step_completion_ids.append(rollout["completion_ids"])
-                if "logprobs"       in rollout and rollout["logprobs"]       is not None:
-                    step_logprobs.append(rollout["logprobs"])
                 break
 
             # Half-step 2: baseline defender responds and triggers reward
@@ -487,37 +544,37 @@ def _run_single_episode(
             ))
             step_reward = (obs.fraudster_reward or 0.0)
 
+        all_completion_ids.extend(gen["completion_ids"])
+        all_logprobs.extend(gen["logprobs"])
         ep_reward       += step_reward
         ep_format_valid += float(is_json)
         ep_action_legal += float(is_legal)
         n_steps         += 1
 
-        # ── Accumulate trajectory tensors ─────────────────────────────────────
-        if "prompt_ids"     in rollout and rollout["prompt_ids"]     is not None:
-            step_prompt_ids.append(rollout["prompt_ids"])
-        if "completion_ids" in rollout and rollout["completion_ids"] is not None:
-            step_completion_ids.append(rollout["completion_ids"])
-        if "logprobs"       in rollout and rollout["logprobs"]       is not None:
-            step_logprobs.append(rollout["logprobs"])
+    # Edge case: episode ended before the model ever acted
+    if not all_completion_ids:
+        dummy_ids = tokenizer.encode('{"action": "do_nothing", "target": null}', add_special_tokens=False) if tokenizer else [0]
+        first_prompt_ids   = first_prompt_ids or []
+        all_completion_ids = dummy_ids
+        all_logprobs       = [0.0] * len(dummy_ids)
 
-    # Final state info (used for evasion reward)
     final_alert = 0.0
     if obs.fraudster_obs:
         final_alert = float(obs.fraudster_obs.get("alert_level", 0.0))
 
     return {
-        "prompt_ids":     step_prompt_ids,       # list of tensors per step
-        "completion_ids": step_completion_ids,
-        "logprobs":       step_logprobs,
+        "prompt_ids":     first_prompt_ids or [],
+        "completion_ids": all_completion_ids,
+        "logprobs":       all_logprobs,
         "episode_reward": ep_reward,
-        "format_valid":   ep_format_valid / max(1, n_steps),  # 0-1 fraction
-        "action_legal":   ep_action_legal / max(1, n_steps),  # 0-1 fraction
+        "format_valid":   ep_format_valid / max(1, n_steps),
+        "action_legal":   ep_action_legal / max(1, n_steps),
         "final_alert":    final_alert,
     }
 
 
 # ---------------------------------------------------------------------------
-# Rollout function factory
+# Rollout function factory — TRL 1.2.0 API: (prompts, trainer)
 # ---------------------------------------------------------------------------
 
 def make_rollout_func(
@@ -525,101 +582,69 @@ def make_rollout_func(
     agent: str,
     system_prompt: str,
     max_turns: int = DEFAULT_MAX_STEPS,
+    max_new_tokens: int = 128,
 ):
     """
-    Returns a rollout_func compatible with TRL's GRPOTrainer.
+    Return a rollout_func for TRL 1.2.0's GRPOTrainer that uses a direct
+    FraudEnvironment instance (no HTTP server required).
 
-    The returned function plays ``num_generations`` independent episodes —
-    each with a different random seed — giving GRPO a group of trajectories
-    with naturally varying rewards to compute relative advantages from.
+    TRL 1.2.0 rollout_func signature: ``(prompts, trainer)``
+      prompts : list of dataset rows for the current process
+      trainer : GRPOTrainer instance (provides .model, .processing_class, .args)
 
-    Parameters
-    ----------
-    env:
-        A ``FraudEnvironment`` instance (used directly, no HTTP server).
-    agent:
-        ``"defender"`` or ``"fraudster"``.
-    system_prompt:
-        System-role message fed to the model at every step.
-    max_turns:
-        Maximum episode length.
+    Returns a dict with List[List[int]] for prompt/completion IDs and
+    List[List[float]] for logprobs, plus episode-level scalars for reward fns.
     """
-    defender_baseline = BaselineRuleDetector()
+    defender_baseline  = BaselineRuleDetector()
     fraudster_baseline = BaselineFraudster()
 
-    def rollout_func(trainer, _env, tokenizer, prompt, _system_prompt, _max_turns):
-        """
-        Play num_generations episodes and return concatenated trajectories.
-
-        Parameters (injected by GRPOTrainer):
-            trainer       : GRPOTrainer instance (model + config).
-            _env          : environment passed by GRPOTrainer (we use our own).
-            tokenizer     : HF tokenizer (available if needed).
-            prompt        : one dataset row dict (contains task_name, seed).
-            _system_prompt: system prompt from GRPOTrainer config (we override).
-            _max_turns    : max turns from GRPOTrainer config (we override).
-
-        Returns a dict with the required keys for GRPOTrainer:
-            prompt_ids     : (num_gen, total_prompt_len)
-            completion_ids : (num_gen, total_completion_len)
-            logprobs       : (num_gen, total_completion_len)
-            + extra reward-metadata keys (one value per generation)
-        """
+    def rollout_func(prompts: List[Dict], trainer) -> Dict[str, Any]:
         num_gens  = trainer.args.num_generations
-        task_name = prompt.get("task_name", "random")
-        base_seed = prompt.get("seed", random.randint(0, 2**20))
+        model     = trainer.model
+        tokenizer = trainer.processing_class
 
-        # ── Run num_generations independent episodes ──────────────────────────
-        episodes = []
-        for gen_idx in range(num_gens):
-            ep = _run_single_episode(
-                trainer=trainer,
-                env=env,
-                agent=agent,
-                system_prompt=system_prompt,
-                task_name=task_name,
-                seed=base_seed + gen_idx,
-                max_turns=max_turns,
-                defender_baseline=defender_baseline,
-                fraudster_baseline=fraudster_baseline,
-            )
-            episodes.append(ep)
+        all_prompt_ids:     List[List[int]]   = []
+        all_completion_ids: List[List[int]]   = []
+        all_logprobs:       List[List[float]] = []
+        all_ep_rewards:     List[float]       = []
+        all_format_valids:  List[float]       = []
+        all_action_legals:  List[float]       = []
+        all_alert_levels:   List[float]       = []
 
-        # ── Stack tensors from all generations ────────────────────────────────
-        # Each episode has a list of per-step tensors; concatenate steps then
-        # stack generations.  Handle empty trajectories gracefully.
-        def _cat_steps(tensor_lists):
-            """Concatenate step tensors for each gen, then stack across gens."""
-            if not _TORCH_AVAILABLE:
-                return None
-            rows = []
-            for step_tensors in tensor_lists:
-                if step_tensors:
-                    rows.append(_torch.cat(step_tensors, dim=-1))
-                else:
-                    rows.append(_torch.zeros(1, 1, dtype=_torch.long))
-            if not rows:
-                return _torch.zeros(num_gens, 1, dtype=_torch.long)
-            max_len = max(r.shape[-1] for r in rows)
-            padded  = [
-                _F.pad(r, (0, max_len - r.shape[-1]))
-                for r in rows
-            ]
-            return _torch.cat(padded, dim=0)   # (num_gens, max_len)
+        for prompt in prompts:
+            task_name = prompt.get("task_name", "random")
+            base_seed = prompt.get("seed", random.randint(0, 2 ** 20))
 
-        prompt_ids_tensor     = _cat_steps([ep["prompt_ids"]     for ep in episodes])
-        completion_ids_tensor = _cat_steps([ep["completion_ids"] for ep in episodes])
-        logprobs_tensor       = _cat_steps([ep["logprobs"]       for ep in episodes])
+            for gen_idx in range(num_gens):
+                ep = _run_single_episode(
+                    model=model,
+                    tokenizer=tokenizer,
+                    env=env,
+                    agent=agent,
+                    system_prompt=system_prompt,
+                    task_name=task_name,
+                    seed=base_seed + gen_idx,
+                    max_turns=max_turns,
+                    max_new_tokens=max_new_tokens,
+                    defender_baseline=defender_baseline,
+                    fraudster_baseline=fraudster_baseline,
+                )
+                all_prompt_ids.append(ep["prompt_ids"])
+                all_completion_ids.append(ep["completion_ids"])
+                all_logprobs.append(ep["logprobs"])
+                all_ep_rewards.append(ep["episode_reward"])
+                all_format_valids.append(ep["format_valid"])
+                all_action_legals.append(ep["action_legal"])
+                all_alert_levels.append(ep["final_alert"])
 
         return {
-            "prompt_ids":     prompt_ids_tensor,
-            "completion_ids": completion_ids_tensor,
-            "logprobs":       logprobs_tensor,
-            # ── Per-generation reward metadata (one float per gen) ────────────
-            "episode_rewards": [ep["episode_reward"] for ep in episodes],
-            "format_valids":   [ep["format_valid"]   for ep in episodes],
-            "action_legals":   [ep["action_legal"]   for ep in episodes],
-            "alert_levels":    [ep["final_alert"]    for ep in episodes],
+            "prompt_ids":     all_prompt_ids,
+            "completion_ids": all_completion_ids,
+            "logprobs":       all_logprobs,
+            "episode_rewards": all_ep_rewards,
+            "format_valids":   all_format_valids,
+            "action_legals":   all_action_legals,
+            "alert_levels":    all_alert_levels,
         }
 
     return rollout_func
@@ -723,7 +748,6 @@ def train(
     num_generations:  int   = 4,
     batch_size:       int   = 1,
     grad_accum:       int   = 16,
-    max_prompt_len:   int   = 2048,
     max_comp_len:     int   = 128,
     use_vllm:         bool  = False,
     output_dir:       str   = "outputs",
@@ -756,8 +780,6 @@ def train(
         Per-device batch size (keep at 1 for long sequences).
     grad_accum:
         Gradient accumulation steps (effective batch = batch_size × grad_accum).
-    max_prompt_len:
-        Maximum token length of the observation prompt.
     max_comp_len:
         Maximum token length of the model's action completion.
     use_vllm:
@@ -807,6 +829,7 @@ def train(
 
     # ── GRPOConfig ────────────────────────────────────────────────────────────
     # Mirrors the Wordle example from the course; adapted for our environment.
+    _no_gpu = not (_TORCH_AVAILABLE and _torch.cuda.is_available())
     grpo_config = GRPOConfig(
         output_dir=agent_out_dir,
         num_train_epochs=epochs,
@@ -814,17 +837,16 @@ def train(
         per_device_train_batch_size=batch_size,
         gradient_accumulation_steps=grad_accum,
         num_generations=num_generations,
-        max_prompt_length=max_prompt_len,
         max_completion_length=max_comp_len,
-        gradient_checkpointing=True,
-        # vLLM colocate mode — shares GPU for generation + training (A100+)
-        use_vllm=use_vllm,
-        vllm_mode="colocate" if use_vllm else None,
-        vllm_gpu_memory_utilization=0.3 if use_vllm else None,
-        # Logging
-        logging_steps=5,
+        gradient_checkpointing=not _no_gpu,
+        use_cpu=_no_gpu,
+        bf16=False,
+        fp16=False,
+        use_vllm=use_vllm and not _no_gpu,
+        vllm_gpu_memory_utilization=0.3 if (use_vllm and not _no_gpu) else None,
+        logging_steps=1,
         save_steps=50,
-        report_to="none",       # swap to "wandb" or "trackio" if needed
+        report_to="none",
     )
 
     # ── GRPOTrainer ───────────────────────────────────────────────────────────
@@ -934,10 +956,6 @@ def main() -> None:
         help="Gradient accumulation steps (default: 16)"
     )
     parser.add_argument(
-        "--max-prompt-len", type=int, default=2048,
-        help="Max observation prompt tokens (default: 2048)"
-    )
-    parser.add_argument(
         "--max-comp-len", type=int, default=128,
         help="Max action completion tokens (default: 128)"
     )
@@ -967,7 +985,6 @@ def main() -> None:
         lr=args.lr,
         num_generations=args.num_generations,
         grad_accum=args.grad_accum,
-        max_prompt_len=args.max_prompt_len,
         max_comp_len=args.max_comp_len,
         use_vllm=args.use_vllm,
         output_dir=args.output_dir,
