@@ -1,8 +1,8 @@
 ---
 title: Fraud Detection Env
 emoji: 🔍
-colorFrom: red
-colorTo: orange
+colorFrom: blue
+colorTo: green
 sdk: docker
 app_port: 8000
 ---

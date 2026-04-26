@@ -1,0 +1,8 @@
+spec_version: 1
+name: scam-detection
+type: space
+runtime: fastapi
+app: scam_detection.server.app:app
+port: 8000
+
+tasks: []
