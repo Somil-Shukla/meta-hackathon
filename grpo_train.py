@@ -857,9 +857,30 @@ def train(
         report_to="none",
     )
 
+    # ── Model & Tokenizer ────────────────────────────────────────────────────
+    # trl 0.27.1 bug: GRPOTrainer.__init__ accesses model.warnings_issued which
+    # doesn't exist on raw HuggingFace models (only on trl-wrapped models).
+    # Pre-load the model and tokenizer ourselves, patch the missing attribute,
+    # then hand the objects to the trainer so it skips its own loading step.
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    _torch_dtype = _torch.float32 if _no_gpu else _torch.bfloat16
+    _model_obj = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=_torch_dtype,
+    )
+    if not hasattr(_model_obj, "warnings_issued"):
+        _model_obj.warnings_issued = {}
+    _tokenizer = AutoTokenizer.from_pretrained(model_name)
+    # Llama tokenizers have no pad_token by default — batched generation fails
+    # without one, so mirror the eos_token.
+    if _tokenizer.pad_token is None:
+        _tokenizer.pad_token    = _tokenizer.eos_token
+        _tokenizer.pad_token_id = _tokenizer.eos_token_id
+
     # ── GRPOTrainer ───────────────────────────────────────────────────────────
     trainer = GRPOTrainer(
-        model=model_name,
+        model=_model_obj,
+        processing_class=_tokenizer,
         reward_funcs=reward_funcs,
         rollout_func=rollout_func,
         train_dataset=dataset,
