@@ -50,6 +50,7 @@ import json
 import os
 import re
 import textwrap
+import random
 from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
@@ -518,22 +519,24 @@ async def main() -> None:
     families = [t for t in VALID_TASK_NAMES if t != "random"]
 
     async with env:
-        for task_name in families:
-            log_start(
-                task=task_name,
-                defender_model=DEFENDER_MODEL_NAME,
-                fraudster_model=FRAUDSTER_MODEL_NAME,
+        # for task_name in families:
+        #select a random task from families
+        task_name = random.choice(families)
+        log_start(
+            task=task_name,
+            defender_model=DEFENDER_MODEL_NAME,
+            fraudster_model=FRAUDSTER_MODEL_NAME,
+        )
+        success, steps, score = False, 0, 0.0
+        try:
+            success, steps, score = await run_episode(
+                env, defender_llm, fraudster_llm, task_name
             )
-            success, steps, score = False, 0, 0.0
-            try:
-                success, steps, score = await run_episode(
-                    env, defender_llm, fraudster_llm, task_name
-                )
-            except Exception as exc:
-                print(f"  [FATAL] task={task_name} crashed: {exc}", flush=True)
-            finally:
-                log_end(task=task_name, success=success, steps=steps, score=score)
-                print()
+        except Exception as exc:
+            print(f"  [FATAL] task={task_name} crashed: {exc}", flush=True)
+        finally:
+            log_end(task=task_name, success=success, steps=steps, score=score)
+            print()
 
 if __name__ == "__main__":
     asyncio.run(main())
