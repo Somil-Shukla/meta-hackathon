@@ -114,8 +114,57 @@ load_dotenv()
 try:
     from trl import GRPOConfig, GRPOTrainer
     _TRL_AVAILABLE = True
+
+    class FraudGRPOTrainer(GRPOTrainer):
+        """
+        GRPOTrainer subclass that activates rollout_func for standard (non-vLLM)
+        CPU/GPU generation.
+
+        In trl 0.27.x, rollout_func is wired only into the vLLM code paths.  For
+        CPU (or GPU without vLLM) training, the built-in model.generate() is used
+        and the caller's rollout_func is silently ignored — meaning episode-level
+        metadata (format_valids, episode_rewards, etc.) never reaches the reward
+        functions.
+
+        This subclass patches two methods so that when use_vllm=False and a
+        rollout_func is provided, the func is invoked instead of the built-in
+        generation, and its extra-field return values are forwarded to reward
+        functions exactly as trl does in its vLLM paths.
+        """
+
+        def _generate_and_score_completions(self, inputs):
+            # Stash the full dataset-row dicts so _generate_single_turn can pass
+            # complete rows (including task_name and seed) to the rollout_func.
+            self._rollout_inputs = inputs
+            return super()._generate_and_score_completions(inputs)
+
+        def _generate_single_turn(self, prompts: list):
+            if not self.use_vllm and self.rollout_func is not None:
+                num_gens = self.args.num_generations
+                # trl duplicates each prompt num_generations times before calling
+                # generation; rollout_func handles multiple generations internally.
+                # De-duplicate to get one unique row per original dataset item.
+                stashed = getattr(self, "_rollout_inputs", None)
+                if stashed:
+                    unique_inputs = stashed[::num_gens]
+                else:
+                    # Fallback: wrap bare prompt strings into minimal dicts
+                    unique_inputs = [{"prompt": p} for p in prompts[::num_gens]]
+
+                output = self.rollout_func(unique_inputs, self)
+                required_keys = {"prompt_ids", "completion_ids", "logprobs"}
+                extra_fields = {
+                    k: v for k, v in output.items() if k not in required_keys
+                }
+                # Return None for logprobs — no importance-sampling correction
+                # needed in CPU mode (matches standard transformers path).
+                return output["prompt_ids"], output["completion_ids"], None, extra_fields
+
+            return super()._generate_single_turn(prompts)
+
 except ImportError:
     _TRL_AVAILABLE = False
+    FraudGRPOTrainer = None  # type: ignore[assignment,misc]
     print("[WARNING] trl not installed. Install with: pip install trl>=1.2.0")
 
 # ---------------------------------------------------------------------------
@@ -660,23 +709,39 @@ def make_rollout_func(
 # Each must return List[float] of length len(completions).
 # ---------------------------------------------------------------------------
 
-def reward_format_valid(completions: List[str], format_valids: List[float], **kwargs) -> List[float]:
+def reward_format_valid(
+    completions: List[str],
+    format_valids: Optional[List[float]] = None,
+    **kwargs,
+) -> List[float]:
     """
     +1.0 if the model's average output across the episode was valid JSON.
     Rewards consistent, structured output even without correct actions.
     """
+    if format_valids is None:
+        return [0.0] * len(completions)
     return [float(v) for v in format_valids]
 
 
-def reward_action_legal(completions: List[str], action_legals: List[float], **kwargs) -> List[float]:
+def reward_action_legal(
+    completions: List[str],
+    action_legals: Optional[List[float]] = None,
+    **kwargs,
+) -> List[float]:
     """
     +1.0 if the average fraction of steps where the model chose a legal action
     was 1.0 (all steps legal).  Partial credit for partially-legal trajectories.
     """
+    if action_legals is None:
+        return [0.0] * len(completions)
     return [float(v) for v in action_legals]
 
 
-def reward_def_episode(completions: List[str], episode_rewards: List[float], **kwargs) -> List[float]:
+def reward_def_episode(
+    completions: List[str],
+    episode_rewards: Optional[List[float]] = None,
+    **kwargs,
+) -> List[float]:
     """
     Normalised cumulative defender episode reward in [-1, 1].
 
@@ -689,7 +754,11 @@ def reward_def_episode(completions: List[str], episode_rewards: List[float], **k
     return [r / max_abs for r in episode_rewards]
 
 
-def reward_frd_episode(completions: List[str], episode_rewards: List[float], **kwargs) -> List[float]:
+def reward_frd_episode(
+    completions: List[str],
+    episode_rewards: Optional[List[float]] = None,
+    **kwargs,
+) -> List[float]:
     """
     Normalised cumulative fraudster episode reward in [-1, 1].
     """
@@ -699,13 +768,19 @@ def reward_frd_episode(completions: List[str], episode_rewards: List[float], **k
     return [r / max_abs for r in episode_rewards]
 
 
-def reward_frd_evasion(completions: List[str], alert_levels: List[float], **kwargs) -> List[float]:
+def reward_frd_evasion(
+    completions: List[str],
+    alert_levels: Optional[List[float]] = None,
+    **kwargs,
+) -> List[float]:
     """
     Evasion bonus: +1.0 when the fraudster ended the episode completely
     undetected (alert_level = 0), linearly decreasing to 0 at alert_level = 1.
 
     Encourages the fraudster to evade even when cashout was unsuccessful.
     """
+    if alert_levels is None:
+        return [0.5] * len(completions)
     return [max(0.0, 1.0 - float(a)) for a in alert_levels]
 
 
@@ -878,7 +953,9 @@ def train(
         _tokenizer.pad_token_id = _tokenizer.eos_token_id
 
     # ── GRPOTrainer ───────────────────────────────────────────────────────────
-    trainer = GRPOTrainer(
+    # FraudGRPOTrainer extends GRPOTrainer to activate rollout_func for CPU
+    # (non-vLLM) mode — see class definition near the top of this file.
+    trainer = FraudGRPOTrainer(
         model=_model_obj,
         processing_class=_tokenizer,
         reward_funcs=reward_funcs,
