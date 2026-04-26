@@ -428,6 +428,7 @@ def check_legal_compliance(env: FraudEnvironment, task: str, n_steps: int = 10) 
 
 def check_reward_functions(num_gens: int = 4) -> bool:
     _section("[5] Reward function outputs")
+    import grpo_train as _gt
     ok   = True
     comp = ["a"] * num_gens
 
@@ -436,31 +437,46 @@ def check_reward_functions(num_gens: int = 4) -> bool:
     ep_rews   = [float(i - num_gens / 2) for i in range(num_gens)]
     alerts    = [i / num_gens for i in range(num_gens)]
 
-    r = reward_format_valid(comp, format_valids=fmt_vals)
+    # Reward functions now read from _ROLLOUT_CACHE (TRL 1.2 does not forward kwargs).
+    _gt._ROLLOUT_CACHE = [
+        {"format_valid": fmt_vals[i], "action_legal": act_vals[i],
+         "episode_reward": ep_rews[i], "final_alert": alerts[i]}
+        for i in range(num_gens)
+    ]
+
+    r = reward_format_valid(comp)
     ok &= _check("reward_format_valid returns list[float]",
                  isinstance(r, list) and all(isinstance(v, float) for v in r),
                  f"output={r}")
 
-    r = reward_action_legal(comp, action_legals=act_vals)
+    r = reward_action_legal(comp)
     ok &= _check("reward_action_legal returns list[float]",
                  isinstance(r, list) and all(isinstance(v, float) for v in r),
                  f"output={r}")
 
-    r = reward_def_episode(comp, episode_rewards=ep_rews)
-    ok &= _check("reward_def_episode returns normalised list",
-                 isinstance(r, list) and all(-1.0 <= v <= 1.0 for v in r),
+    r = reward_def_episode(comp)
+    ok &= _check("reward_def_episode returns values in [0, 1]",
+                 isinstance(r, list) and all(0.0 <= v <= 1.0 for v in r),
                  f"output={[round(v,2) for v in r]}")
 
-    r = reward_frd_episode(comp, episode_rewards=ep_rews)
-    ok &= _check("reward_frd_episode returns normalised list",
-                 isinstance(r, list) and all(-1.0 <= v <= 1.0 for v in r),
+    r = reward_frd_episode(comp)
+    ok &= _check("reward_frd_episode returns values in [0, 1]",
+                 isinstance(r, list) and all(0.0 <= v <= 1.0 for v in r),
                  f"output={[round(v,2) for v in r]}")
 
-    # Use explicit [0.0, 0.5, 1.0] so first=1.0 and last=0.0 regardless of num_gens
-    r_ev = reward_frd_evasion(["x","y","z"], alert_levels=[0.0, 0.5, 1.0])
+    # Use explicit 3-entry cache so first=1.0 (alert=0) and last=0.0 (alert=1)
+    _gt._ROLLOUT_CACHE = [
+        {"final_alert": 0.0, "format_valid": 0.0, "action_legal": 0.0, "episode_reward": 0.0},
+        {"final_alert": 0.5, "format_valid": 0.0, "action_legal": 0.0, "episode_reward": 0.0},
+        {"final_alert": 1.0, "format_valid": 0.0, "action_legal": 0.0, "episode_reward": 0.0},
+    ]
+    r_ev = reward_frd_evasion(["x", "y", "z"])
     ok &= _check("reward_frd_evasion: 0 alert → 1.0, max alert → 0.0",
                  abs(r_ev[0] - 1.0) < 1e-6 and abs(r_ev[-1]) < 1e-6,
                  f"output={[round(v,2) for v in r_ev]}")
+
+    # Restore cache to empty after test
+    _gt._ROLLOUT_CACHE = []
     return ok
 
 

@@ -165,6 +165,34 @@ class RewardEngine:
             f_reward += FRAUDSTER_ROUTE_LOSS_PENALTY * n_newly_inactive
             fraudster_breakdown["route_loss"] = FRAUDSTER_ROUTE_LOSS_PENALTY * n_newly_inactive
 
+        # Normalise both rewards to [-1, 1] using theoretical min/max bounds.
+        # [-1, 1] is preferred for GRPO: GRPO computes group-relative advantages
+        # (reward_i - mean), so a meaningful zero point (neutral action = ~0)
+        # gives clearer penalty/incentive signals than shifting everything to [0,1].
+        #
+        # Defender: best = fraud prevented + max early bonus (1.3)
+        #           worst = false positive freeze + friction + unnecessary freeze
+        #                   + missed fraud (−1.45)
+        _d_min = (DEFENDER_FALSE_POSITIVE_PENALTY
+                  + DEFENDER_CUSTOMER_FRICTION_PENALTY
+                  + DEFENDER_UNNECESSARY_FREEZE_PENALTY
+                  + DEFENDER_MISSED_FRAUD_PENALTY * 0.5)
+        _d_max = DEFENDER_FRAUD_PREVENTED_REWARD + DEFENDER_EARLY_DETECTION_BONUS
+        d_reward = 2.0 * (d_reward - _d_min) / (_d_max - _d_min) - 1.0
+
+        # Fraudster: best = successful cashout (1.0)
+        #            worst = freeze + block + failed cashout + 5× route loss (−2.2)
+        _f_min = (FRAUDSTER_FREEZE_PENALTY
+                  + FRAUDSTER_BLOCK_PENALTY
+                  + FRAUDSTER_FAILED_CASHOUT_PENALTY
+                  + FRAUDSTER_ROUTE_LOSS_PENALTY * 5)
+        _f_max = FRAUDSTER_SUCCESSFUL_CASHOUT_REWARD
+        f_reward = 2.0 * (f_reward - _f_min) / (_f_max - _f_min) - 1.0
+
+        # Clamp to [-1, 1] to guard against edge cases outside theoretical bounds.
+        d_reward = max(-1.0, min(1.0, d_reward))
+        f_reward = max(-1.0, min(1.0, f_reward))
+
         defender_breakdown["total"] = round(d_reward, 4)
         fraudster_breakdown["total"] = round(f_reward, 4)
 

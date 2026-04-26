@@ -758,15 +758,15 @@ def reward_def_episode(
     **kwargs,
 ) -> List[float]:
     """
-    Normalised cumulative defender episode reward in [-1, 1].
+    Cumulative defender episode reward mapped to [0, 1].
 
-    The normalisation is relative to the group max absolute reward so that
-    GRPO's group-relative advantage computation has consistent scale.
+    Normalises within the group (relative to max absolute reward) then maps
+    [-1, 1] → [0, 1] via (r + 1) / 2 so the output is always in [0, 1].
     """
     rewards = [_ROLLOUT_CACHE[i].get("episode_reward", 0.0) if i < len(_ROLLOUT_CACHE) else 0.0
                for i in range(len(completions))]
     max_abs = max(abs(r) for r in rewards) or 1.0
-    return [r / max_abs for r in rewards]
+    return [(r / max_abs + 1.0) / 2.0 for r in rewards]
 
 
 def reward_frd_episode(
@@ -775,12 +775,12 @@ def reward_frd_episode(
     **kwargs,
 ) -> List[float]:
     """
-    Normalised cumulative fraudster episode reward in [-1, 1].
+    Cumulative fraudster episode reward mapped to [0, 1].
     """
     rewards = [_ROLLOUT_CACHE[i].get("episode_reward", 0.0) if i < len(_ROLLOUT_CACHE) else 0.0
                for i in range(len(completions))]
     max_abs = max(abs(r) for r in rewards) or 1.0
-    return [r / max_abs for r in rewards]
+    return [(r / max_abs + 1.0) / 2.0 for r in rewards]
 
 
 def reward_frd_evasion(

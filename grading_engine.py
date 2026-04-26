@@ -106,6 +106,13 @@ class GradingEngine:
         false_positives = world.false_positives
         total_legit_frozen = world.legitimate_users_frozen
 
+        # total_prevented only tracks transaction-level holds. Freeze and
+        # block_merchant disable routes without adding to it. The true
+        # prevented amount = everything that was not laundered.
+        true_prevented = round(
+            max(0.0, world.total_fraud_amount - world.total_laundered), 2
+        )
+
         # False positive rate = FP / (FP + TP freezes)
         total_interventions = total_frozen_fraud + false_positives
         fp_rate = (
@@ -161,7 +168,7 @@ class GradingEngine:
             episode_id=world.episode_id,
             fraud_family=world.fraud_family,
             total_steps=world.step,
-            total_fraud_prevented=round(world.total_prevented, 2),
+            total_fraud_prevented=true_prevented,
             total_fraud_escaped=round(world.total_laundered, 2),
             false_positive_count=false_positives,
             false_positive_rate=fp_rate,
