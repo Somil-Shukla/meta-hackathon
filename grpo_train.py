@@ -830,6 +830,13 @@ def train(
     # ── GRPOConfig ────────────────────────────────────────────────────────────
     # Mirrors the Wordle example from the course; adapted for our environment.
     _no_gpu = not (_TORCH_AVAILABLE and _torch.cuda.is_available())
+    # generation_batch_size must be divisible by num_generations (trl 0.27+).
+    # Round up batch_size to the nearest multiple of num_generations.
+    import math as _math
+    _gen_batch_size = max(
+        num_generations,
+        _math.ceil(batch_size / num_generations) * num_generations,
+    )
     grpo_config = GRPOConfig(
         output_dir=agent_out_dir,
         num_train_epochs=epochs,
@@ -837,6 +844,7 @@ def train(
         per_device_train_batch_size=batch_size,
         gradient_accumulation_steps=grad_accum,
         num_generations=num_generations,
+        generation_batch_size=_gen_batch_size,
         max_completion_length=max_comp_len,
         gradient_checkpointing=not _no_gpu,
         use_cpu=_no_gpu,
