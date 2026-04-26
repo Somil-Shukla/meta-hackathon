@@ -97,6 +97,11 @@ except ImportError:
 
 from dotenv import load_dotenv
 
+# TRL 1.2.0 does NOT forward custom rollout_func fields to reward functions.
+# We use this module-level cache: rollout_func writes to it, reward functions read from it.
+# Each entry corresponds to one generation slot in the current training step.
+_ROLLOUT_CACHE: List[Dict[str, float]] = []
+
 try:
     from datasets import Dataset as _HFDataset
     def _make_hf_dataset(rows: list):
@@ -648,6 +653,10 @@ def make_rollout_func(
     fraudster_baseline = BaselineFraudster()
 
     def rollout_func(prompts: List[Dict], trainer) -> Dict[str, Any]:
+        global _ROLLOUT_CACHE
+        # Reset cache for this training step; reward functions will read it.
+        _ROLLOUT_CACHE = []
+
         num_gens  = trainer.args.num_generations
         model     = trainer.model
         tokenizer = trainer.processing_class
@@ -655,14 +664,19 @@ def make_rollout_func(
         all_prompt_ids:     List[List[int]]   = []
         all_completion_ids: List[List[int]]   = []
         all_logprobs:       List[List[float]] = []
-        all_ep_rewards:     List[float]       = []
-        all_format_valids:  List[float]       = []
-        all_action_legals:  List[float]       = []
-        all_alert_levels:   List[float]       = []
 
         for prompt in prompts:
-            task_name = prompt.get("task_name", "random")
-            base_seed = prompt.get("seed", random.randint(0, 2 ** 20))
+            # TRL 1.2 passes the "prompt" column value as a plain string,
+            # not the full dataset row dict.
+            if isinstance(prompt, dict):
+                task_name = prompt.get("task_name", "random")
+                base_seed = prompt.get("seed", random.randint(0, 2 ** 20))
+            else:
+                # parse "Fraud episode — family: <name>" back out
+                import re as _re
+                _m = _re.search(r"family:\s*(\S+)", str(prompt))
+                task_name = _m.group(1) if _m else "random"
+                base_seed = random.randint(0, 2 ** 20)
 
             for gen_idx in range(num_gens):
                 ep = _run_single_episode(
@@ -681,19 +695,19 @@ def make_rollout_func(
                 all_prompt_ids.append(ep["prompt_ids"])
                 all_completion_ids.append(ep["completion_ids"])
                 all_logprobs.append(ep["logprobs"])
-                all_ep_rewards.append(ep["episode_reward"])
-                all_format_valids.append(ep["format_valid"])
-                all_action_legals.append(ep["action_legal"])
-                all_alert_levels.append(ep["final_alert"])
+                # Store per-episode metrics in cache for reward functions to read.
+                _ROLLOUT_CACHE.append({
+                    "episode_reward": ep["episode_reward"],
+                    "format_valid":   ep["format_valid"],
+                    "action_legal":   ep["action_legal"],
+                    "final_alert":    ep["final_alert"],
+                })
 
+        # TRL 1.2.0 only needs these three keys from rollout_func.
         return {
             "prompt_ids":     all_prompt_ids,
             "completion_ids": all_completion_ids,
             "logprobs":       all_logprobs,
-            "episode_rewards": all_ep_rewards,
-            "format_valids":   all_format_valids,
-            "action_legals":   all_action_legals,
-            "alert_levels":    all_alert_levels,
         }
 
     return rollout_func
@@ -716,7 +730,8 @@ def reward_format_valid(
 ) -> List[float]:
     """
     +1.0 if the model's average output across the episode was valid JSON.
-    Rewards consistent, structured output even without correct actions.
+    Reads per-generation metrics from _ROLLOUT_CACHE (TRL 1.2 does not forward
+    custom rollout_func fields to reward functions).
     """
     if format_valids is None:
         return [0.0] * len(completions)
@@ -748,10 +763,10 @@ def reward_def_episode(
     The normalisation is relative to the group max absolute reward so that
     GRPO's group-relative advantage computation has consistent scale.
     """
-    if not episode_rewards:
-        return [0.0] * len(completions)
-    max_abs = max(abs(r) for r in episode_rewards) or 1.0
-    return [r / max_abs for r in episode_rewards]
+    rewards = [_ROLLOUT_CACHE[i].get("episode_reward", 0.0) if i < len(_ROLLOUT_CACHE) else 0.0
+               for i in range(len(completions))]
+    max_abs = max(abs(r) for r in rewards) or 1.0
+    return [r / max_abs for r in rewards]
 
 
 def reward_frd_episode(
@@ -762,10 +777,10 @@ def reward_frd_episode(
     """
     Normalised cumulative fraudster episode reward in [-1, 1].
     """
-    if not episode_rewards:
-        return [0.0] * len(completions)
-    max_abs = max(abs(r) for r in episode_rewards) or 1.0
-    return [r / max_abs for r in episode_rewards]
+    rewards = [_ROLLOUT_CACHE[i].get("episode_reward", 0.0) if i < len(_ROLLOUT_CACHE) else 0.0
+               for i in range(len(completions))]
+    max_abs = max(abs(r) for r in rewards) or 1.0
+    return [r / max_abs for r in rewards]
 
 
 def reward_frd_evasion(
